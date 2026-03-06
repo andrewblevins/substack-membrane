@@ -250,6 +250,16 @@ def clean_html(html_body):
         strip=True,
     )
 
+    # Strip Substack email header boilerplate (after bleach so tags don't interfere):
+    # Keep the subtitle (before "Subscribe here"), cut from "Subscribe here" through author+date
+    month_pattern = r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}'
+    substack_header = re.search(
+        r'Subscribe here(?:</a>)? for more.*?' + month_pattern,
+        cleaned, flags=re.IGNORECASE | re.DOTALL
+    )
+    if substack_header and substack_header.start() < len(cleaned) * 0.3:
+        cleaned = cleaned[:substack_header.start()] + cleaned[substack_header.end():]
+
     # Remove empty tags left behind
     for _ in range(3):
         cleaned = re.sub(r'<(p|h[1-6]|blockquote|li|ul|ol|pre)\b[^>]*>\s*</\1>',
@@ -259,6 +269,35 @@ def clean_html(html_body):
     cleaned = re.sub(
         r'<a[^>]*href="[^"]*(?:unsubscribe|opt[_-]?out|email-preferences|list-manage)[^"]*"[^>]*>.*?</a>',
         '', cleaned, flags=re.IGNORECASE | re.DOTALL
+    )
+
+    # Remove Substack app-link URLs (like/comment/restack buttons)
+    cleaned = re.sub(
+        r'<a[^>]*href="[^"]*substack\.com/app-link[^"]*"[^>]*>.*?</a>',
+        '', cleaned, flags=re.IGNORECASE | re.DOTALL
+    )
+
+    # Unwrap Substack image links (keep images, drop the wrapping <a> tag)
+    def unwrap_substack_img_link(m):
+        imgs = re.findall(r'<img[^>]*>', m.group(0))
+        return ' '.join(imgs) if imgs else ''
+    cleaned = re.sub(
+        r'<a[^>]*href="[^"]*substack\.com[^"]*"[^>]*>\s*(?:<img[^>]*>\s*)*</a>',
+        unwrap_substack_img_link, cleaned, flags=re.IGNORECASE
+    )
+
+    # Remove unclosed <a> tags (e.g. Substack wrapper links around entire article body)
+    open_count = len(re.findall(r'<a\b', cleaned, re.IGNORECASE))
+    close_count = len(re.findall(r'</a>', cleaned, re.IGNORECASE))
+    if open_count > close_count:
+        # Remove the extra opening <a> tags (typically substack redirect wrappers at the start)
+        for _ in range(open_count - close_count):
+            cleaned = re.sub(r'<a\b[^>]*>', '', cleaned, count=1, flags=re.IGNORECASE)
+
+    # Remove empty links (no visible text)
+    cleaned = re.sub(
+        r'<a[^>]*>\s*</a>',
+        '', cleaned, flags=re.IGNORECASE
     )
 
     # Remove zero-width/invisible Unicode characters and non-breaking space padding
@@ -274,11 +313,17 @@ def clean_html(html_body):
 
 
 def extract_substack_author(from_header):
-    """Parse the author/newsletter name from the From header."""
+    """Parse the publication name from the From header."""
     # Typical format: "Newsletter Name <something@substack.com>"
+    # or: "Person Name from Publication Name <something@substack.com>"
     match = re.match(r'^"?([^"<]+)"?\s*<', from_header)
     if match:
-        return match.group(1).strip()
+        name = match.group(1).strip()
+        # Extract publication name after "from" (e.g. "Zvi Mowshowitz from Don't Worry About the Vase")
+        from_match = re.search(r'\bfrom\s+(.+)$', name, re.IGNORECASE)
+        if from_match:
+            return from_match.group(1).strip()
+        return name
     return from_header
 
 
@@ -391,7 +436,24 @@ def fetch_articles(cfg):
             date_tuple = datetime.now(timezone.utc)
 
         author = extract_substack_author(from_hdr)
+
+        # Extract original article URL from List-Post header or "View in browser" link
+        original_url = ""
+        list_post = msg.get("List-Post", "")
+        lp_match = re.search(r'<(.+?)>', list_post)
+        if lp_match:
+            original_url = lp_match.group(1)
+
         html_body, text_body = extract_body_html(msg)
+
+        if not original_url and html_body:
+            vib = re.search(
+                r'href="([^"]+)"[^>]*>\s*(?:View (?:in browser|online)|Read online)',
+                html_body, re.IGNORECASE
+            )
+            if vib:
+                original_url = vib.group(1)
+
         content_html = clean_html(html_body)
 
         # If no HTML, wrap plain text in <pre>
@@ -402,13 +464,31 @@ def fetch_articles(cfg):
             seen.add(mid_str)
             continue
 
+        # Extract subtitle (text before first <p> tag) for Substack articles
+        subtitle = ""
+        pre_match = re.match(r'^(.*?)\s*<p\b', content_html, re.DOTALL)
+        if pre_match:
+            sub_text = re.sub(r'<[^>]+>', ' ', pre_match.group(1)).strip()
+            sub_text = re.sub(r'\s+', ' ', sub_text)
+            # Clean up subtitle boilerplate
+            sub_text = re.sub(r'\|.*$', '', sub_text).strip()  # remove "| nytimes.com" etc.
+            sub_text = re.sub(r'^(?:Listen|Watch|Read) now \(\d+ mins?\)\s*', '', sub_text).strip()
+            # Only use as subtitle if it's a reasonable length and not just "..."
+            if 5 < len(sub_text) < 300 and sub_text not in ('...', '·'):
+                subtitle = sub_text
+                # Remove the subtitle text from content body
+                content_html = content_html[pre_match.end() - 2:]  # keep the <p
+                content_html = '<p' + content_html
+
         articles.append({
             "title": subject,
             "author": author,
+            "subtitle": subtitle,
             "date": date_tuple.isoformat(),
             "date_display": date_tuple.strftime("%B %-d, %Y"),
             "content_html": content_html,
             "message_id": message_id,
+            "original_url": original_url,
         })
 
         seen.add(mid_str)
@@ -461,13 +541,16 @@ def generate_html(articles, output_path):
         article_blocks.append(
             f'<article class="article" id="article-{i}" data-id="{safe_mid}" style="display:none;">'
             f'<div class="article-nav">'
-            f'<button class="back-btn" onclick="showToc()">&larr; Back</button>'
+            f'<button class="back-btn" onclick="history.back()">&larr; Back</button>'
             f'<button class="delete-btn" onclick="deleteArticle(\'{safe_mid}\')" aria-label="Remove" title="Remove">&times;</button>'
             f'</div>'
             f'<header class="article-header">'
-            f'<div class="article-meta">{safe_author} &middot; {art["date_display"]}</div>'
+            f'<div class="article-meta">{safe_author} &middot; {art["date_display"]}'
+            + (f' &middot; <a href="{escape(art["original_url"], quote=True)}" class="original-link" target="_blank">View original</a>' if art.get("original_url") else '')
+            + f'</div>'
             f'<h2 class="article-title">{safe_title}</h2>'
-            f'</header>'
+            + (f'<p class="article-subtitle">{escape(art["subtitle"])}</p>' if art.get("subtitle") else '')
+            + f'</header>'
             f'<div class="article-body">'
             f'{art["content_html"]}'
             f'</div>'
@@ -497,9 +580,9 @@ def generate_html(articles, output_path):
   :root {
     --bg: #f5f0e8;
     --bg-code: #ece6da;
-    --text: #2c2c2c;
+    --text: #1a1a1a;
     --text-secondary: #7a7368;
-    --accent: #b44a2d;
+    --accent: #a63e20;
     --border: #ddd6cb;
     --serif: 'Source Serif 4', Georgia, serif;
     --sans: 'IBM Plex Sans', -apple-system, sans-serif;
@@ -522,6 +605,9 @@ def generate_html(articles, output_path):
     color: var(--text);
     line-height: 1.7;
     -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    font-feature-settings: 'kern' 1, 'liga' 1, 'calt' 1;
     transition: background 0.3s, color 0.3s;
   }
 
@@ -668,7 +754,9 @@ def generate_html(articles, output_path):
     color: #fff;
   }
   .article-header {
-    padding: 24px 0 32px;
+    padding: 28px 0 36px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 36px;
   }
   .article-meta {
     font-family: var(--sans);
@@ -677,45 +765,71 @@ def generate_html(articles, output_path):
     color: var(--text-secondary);
     margin-bottom: 8px;
   }
+  .original-link {
+    color: var(--accent);
+    text-decoration: none;
+    font-weight: 500;
+  }
+  .original-link:hover { text-decoration: underline; }
   .article-title {
     font-family: var(--serif);
-    font-size: 30px;
+    font-size: 32px;
     font-weight: 600;
-    line-height: 1.3;
+    line-height: 1.2;
+    letter-spacing: -0.02em;
     color: var(--text);
+  }
+  .article-subtitle {
+    font-family: var(--serif);
+    font-size: 19px;
+    font-weight: 300;
+    line-height: 1.5;
+    color: var(--text-secondary);
+    margin-top: 10px;
+    font-style: italic;
   }
   .article-body {
     font-size: 19px;
-    line-height: 1.8;
+    line-height: 1.75;
+    letter-spacing: -0.003em;
+    word-spacing: 0.01em;
   }
-  .article-body p { margin-bottom: 1.2em; }
+  .article-body p { margin-bottom: 1.15em; }
   .article-body h1, .article-body h2, .article-body h3, .article-body h4 {
     font-family: var(--serif);
-    margin-top: 1.6em;
-    margin-bottom: 0.6em;
-    line-height: 1.3;
+    margin-top: 1.8em;
+    margin-bottom: 0.5em;
+    line-height: 1.25;
+    letter-spacing: -0.015em;
   }
   .article-body h1 { font-size: 26px; }
   .article-body h2 { font-size: 22px; }
   .article-body h3 { font-size: 19px; font-weight: 600; }
   .article-body a {
     color: var(--accent);
+    text-decoration: underline;
     text-decoration-thickness: 1px;
     text-underline-offset: 3px;
+    text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
+    transition: text-decoration-color 0.15s;
+  }
+  .article-body a:hover {
+    text-decoration-color: var(--accent);
   }
   .article-body img {
     max-width: 100%;
     height: auto;
     border-radius: 6px;
-    margin: 1.2em 0;
+    margin: 1.2em auto;
     display: block;
   }
   .article-body blockquote {
-    border-left: 3px solid var(--accent);
+    border-left: 2px solid var(--accent);
     padding-left: 24px;
     margin: 1.6em 0;
     color: var(--text-secondary);
     font-style: italic;
+    font-size: 18px;
   }
   .article-body pre {
     background: var(--bg-code);
@@ -807,19 +921,31 @@ def generate_html(articles, output_path):
       updateThemeIcon();
     })();
 
-    function showArticle(index) {
+    function showArticle(index, pushState) {
       document.getElementById('view-toc').style.display = 'none';
       document.querySelectorAll('.article').forEach(a => a.style.display = 'none');
       const target = document.getElementById('article-' + index);
       if (target) target.style.display = 'block';
       window.scrollTo(0, 0);
+      if (pushState !== false) history.pushState({article: index}, '');
     }
 
-    function showToc() {
+    function showToc(pushState) {
       document.querySelectorAll('.article').forEach(a => a.style.display = 'none');
       document.getElementById('view-toc').style.display = 'block';
       window.scrollTo(0, 0);
+      if (pushState !== false) history.pushState({toc: true}, '');
     }
+
+    window.addEventListener('popstate', function(e) {
+      if (e.state && e.state.article !== undefined) {
+        showArticle(e.state.article, false);
+      } else {
+        showToc(false);
+      }
+    });
+
+    history.replaceState({toc: true}, '');
 
     const STORAGE_KEY = 'substack-membrane-deleted';
 
@@ -840,7 +966,8 @@ def generate_html(articles, output_path):
       if (!deleted.includes(id)) deleted.push(id);
       localStorage.setItem(STORAGE_KEY, JSON.stringify(deleted));
       updateCount();
-      showToc();
+      showToc(false);
+      history.replaceState({toc: true}, '');
     }
 
     function updateCount() {
