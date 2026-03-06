@@ -1,0 +1,9 @@
+{
+    "email": "your-real-email@gmail.com",
+    "app_password": "xxxx xxxx xxxx xxxx",
+    "imap_server": "imap.gmail.com",
+    "max_articles": 50,
+    "output_path": "reading.html",
+    "gmail_label": "",
+    "auto_archive": false
+}

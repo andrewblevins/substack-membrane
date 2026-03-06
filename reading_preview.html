@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reading</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,300;0,8..60,400;0,8..60,600;1,8..60,300;1,8..60,400&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  :root {
+    --bg: #faf8f4;
+    --bg-card: #ffffff;
+    --text: #2c2c2c;
+    --text-secondary: #6b6b6b;
+    --accent: #b44a2d;
+    --border: #e8e4de;
+    --serif: 'Source Serif 4', Georgia, serif;
+    --sans: 'IBM Plex Sans', -apple-system, sans-serif;
+  }
+
+  body {
+    font-family: var(--serif);
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .page-header {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 60px 24px 20px;
+    border-bottom: 1px solid var(--border);
+  }
+  .page-header h1 {
+    font-family: var(--sans);
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  .page-header .timestamp {
+    font-family: var(--sans);
+    font-size: 13px;
+    color: var(--text-secondary);
+    margin-top: 4px;
+  }
+  .article-count {
+    font-family: var(--sans);
+    font-size: 13px;
+    color: var(--text-secondary);
+    margin-top: 2px;
+  }
+
+  .toc {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 24px 24px 32px;
+    border-bottom: 1px solid var(--border);
+  }
+  .toc-label {
+    font-family: var(--sans);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+    margin-bottom: 12px;
+  }
+  .toc-item {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    padding: 6px 0;
+    text-decoration: none;
+    color: var(--text);
+    transition: color 0.15s;
+  }
+  .toc-item:hover { color: var(--accent); }
+  .toc-author {
+    font-family: var(--sans);
+    font-size: 13px;
+    font-weight: 500;
+    flex-shrink: 0;
+    min-width: 140px;
+  }
+  .toc-title {
+    font-size: 15px;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .toc-date {
+    font-family: var(--sans);
+    font-size: 12px;
+    color: var(--text-secondary);
+    flex-shrink: 0;
+  }
+
+  .articles {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 0 24px 120px;
+  }
+
+  .article {
+    padding: 48px 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .article-header { margin-bottom: 28px; }
+  .article-meta {
+    font-family: var(--sans);
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    margin-bottom: 8px;
+    letter-spacing: 0.01em;
+  }
+  .article-title {
+    font-family: var(--serif);
+    font-size: 28px;
+    font-weight: 600;
+    line-height: 1.3;
+    color: var(--text);
+  }
+
+  .article-body {
+    font-size: 18px;
+    line-height: 1.8;
+  }
+  .article-body p { margin-bottom: 1.2em; }
+  .article-body h1, .article-body h2, .article-body h3 {
+    font-family: var(--serif);
+    margin-top: 1.6em;
+    margin-bottom: 0.6em;
+    line-height: 1.3;
+  }
+  .article-body h1 { font-size: 24px; }
+  .article-body h2 { font-size: 21px; }
+  .article-body h3 { font-size: 18px; font-weight: 600; }
+  .article-body a {
+    color: var(--accent);
+    text-decoration-thickness: 1px;
+    text-underline-offset: 2px;
+  }
+  .article-body blockquote {
+    border-left: 3px solid var(--accent);
+    padding-left: 20px;
+    margin: 1.4em 0;
+    color: var(--text-secondary);
+    font-style: italic;
+  }
+
+  .back-top {
+    position: fixed;
+    bottom: 28px;
+    right: 28px;
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    font-size: 18px;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.3s;
+    font-family: var(--sans);
+  }
+  .back-top.visible { opacity: 1; }
+
+  .demo-banner {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 16px 24px;
+    background: #fff3e0;
+    border-bottom: 1px solid var(--border);
+    font-family: var(--sans);
+    font-size: 13px;
+    color: var(--accent);
+  }
+
+  @media (max-width: 600px) {
+    .page-header { padding: 40px 16px 16px; }
+    .toc { padding: 16px 16px 24px; }
+    .articles { padding: 0 16px 80px; }
+    .article-title { font-size: 22px; }
+    .article-body { font-size: 17px; }
+    .toc-item { flex-wrap: wrap; gap: 4px; }
+    .toc-author { min-width: auto; }
+    .toc-date { display: none; }
+  }
+</style>
+</head>
+<body>
+  <div class="demo-banner">
+    ✦ This is a preview with sample content. Run <strong>python3 substack_reader.py</strong> to populate with your real Substack subscriptions.
+  </div>
+
+  <div class="page-header">
+    <h1>Reading</h1>
+    <div class="timestamp">Updated March 6, 2026 at 3:22 PM</div>
+    <div class="article-count">3 articles</div>
+  </div>
+
+  <nav class="toc">
+    <div class="toc-label">Contents</div>
+    <a class="toc-item" href="#article-0">
+      <span class="toc-author">The Diff</span>
+      <span class="toc-title">Capital Allocation in an Age of Abundance</span>
+      <span class="toc-date">March 5, 2026</span>
+    </a>
+    <a class="toc-item" href="#article-1">
+      <span class="toc-author">Construction Physics</span>
+      <span class="toc-title">Why Building a Bridge Takes So Long Now</span>
+      <span class="toc-date">March 3, 2026</span>
+    </a>
+    <a class="toc-item" href="#article-2">
+      <span class="toc-author">Experimental History</span>
+      <span class="toc-title">The Replication Crisis Was the Easy Part</span>
+      <span class="toc-date">March 1, 2026</span>
+    </a>
+  </nav>
+
+  <main class="articles">
+    <article class="article" id="article-0">
+      <header class="article-header">
+        <div class="article-meta">The Diff · March 5, 2026</div>
+        <h2 class="article-title">Capital Allocation in an Age of Abundance</h2>
+      </header>
+      <div class="article-body">
+        <p>There's a paradox at the heart of modern capital markets: the more abundant capital becomes, the harder it is to allocate well. When money was scarce, the constraint was simple — you funded the things that clearly needed funding and said no to everything else. Now the constraint is attention, judgment, and the ability to distinguish signal from noise in a world drowning in both.</p>
+
+        <p>The best investors have always understood this implicitly. What's changed is that the implicit knowledge now needs to be made explicit, because the number of plausible-sounding investment theses has grown faster than the number of good ones.</p>
+
+        <blockquote>The question is no longer "can we afford to do this?" but "of the thousand things we could afford to do, which three actually matter?"</blockquote>
+
+        <p>This is a different kind of discipline. It's not the discipline of scarcity — saying no because you must — but the discipline of abundance: saying no because you choose to. And it turns out the second kind is much harder.</p>
+
+        <h2>Where This Shows Up</h2>
+
+        <p>Consider venture capital. A decade ago, a Series A round was a meaningful signal — someone with real expertise had decided this company was worth a bet. Today, Series A rounds are so common that the signal has degraded substantially. The information content of "this company raised a Series A" is approaching zero.</p>
+
+        <p>The same pattern plays out in public markets, in corporate R&D budgets, in philanthropy, and in government spending. Abundance doesn't solve the allocation problem. It makes it worse, because it removes the natural filter that scarcity once provided.</p>
+      </div>
+    </article>
+
+    <article class="article" id="article-1">
+      <header class="article-header">
+        <div class="article-meta">Construction Physics · March 3, 2026</div>
+        <h2 class="article-title">Why Building a Bridge Takes So Long Now</h2>
+      </header>
+      <div class="article-body">
+        <p>The Golden Gate Bridge was built in four years, from 1933 to 1937. It was, at the time, the longest suspension bridge in the world and an extraordinary engineering achievement. Today, replacing a much simpler highway overpass routinely takes longer than that.</p>
+
+        <p>The usual explanations — regulation, environmental review, lawsuits — are real but incomplete. They describe the mechanism without explaining the underlying cause. Why do we have so much more regulation now? Why are environmental reviews so extensive? Why do lawsuits succeed so often?</p>
+
+        <p>The deeper answer has to do with how societies accumulate veto points as they age. Every time something goes wrong — a bridge fails, a community is displaced, a wetland is destroyed — we add a new check to the process. Each individual check is reasonable. Collectively, they create a system where building anything is extraordinarily difficult.</p>
+
+        <p>This isn't unique to construction. It's a general pattern in complex organizations and societies. The number of ways to say "no" grows monotonically over time. The number of ways to say "yes" does not.</p>
+
+        <h2>The Accumulation of Caution</h2>
+
+        <p>Think of it as institutional scar tissue. Each scar is a lesson learned. But enough scar tissue and the organism can't move. We've optimized for preventing the last disaster at the cost of making forward progress nearly impossible.</p>
+      </div>
+    </article>
+
+    <article class="article" id="article-2">
+      <header class="article-header">
+        <div class="article-meta">Experimental History · March 1, 2026</div>
+        <h2 class="article-title">The Replication Crisis Was the Easy Part</h2>
+      </header>
+      <div class="article-body">
+        <p>Everyone knows about the replication crisis now. Studies don't replicate. P-hacking is bad. Sample sizes were too small. We've internalized these lessons and moved on, or at least we think we have.</p>
+
+        <p>But here's the thing: the replication crisis was the easy problem. Finding that a study doesn't replicate is straightforward — you just run it again. The harder problem is what to do when you realize that entire research programs, built on decades of non-replicating findings, have shaped policy, education, and clinical practice in ways that are now deeply embedded.</p>
+
+        <p>You can't "replicate" a policy. You can't re-run a generation of therapy patients with a corrected protocol. The downstream effects of bad science don't disappear when the original paper is retracted. They persist in textbooks, in training programs, in the intuitions of practitioners who learned the wrong thing so long ago that it feels like common sense.</p>
+
+        <blockquote>Retraction fixes the scientific record. It does not fix the world that the scientific record built.</blockquote>
+
+        <p>This is the hard part that nobody wants to talk about, because it doesn't have a clean solution. Pre-registration doesn't help. Larger sample sizes don't help. Open data doesn't help. Those tools prevent future bad science. They don't undo the damage of past bad science that has already been baked into institutions.</p>
+      </div>
+    </article>
+  </main>
+
+  <button class="back-top" onclick="window.scrollTo({top:0,behavior:'smooth'})" aria-label="Back to top">↑</button>
+
+  <script>
+    const btn = document.querySelector('.back-top');
+    window.addEventListener('scroll', () => {
+      btn.classList.toggle('visible', window.scrollY > 400);
+    });
+  </script>
+</body>
+</html>

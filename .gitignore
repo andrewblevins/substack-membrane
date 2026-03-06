@@ -1,0 +1,6 @@
+config.json
+.reader_state.json
+reading.html
+files.zip
+__pycache__/
+*.pyc
