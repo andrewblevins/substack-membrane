@@ -4,3 +4,4 @@ reading.html
 files.zip
 __pycache__/
 *.pyc
+.venv/

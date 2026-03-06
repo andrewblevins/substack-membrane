@@ -18,7 +18,7 @@ Setup:
   5. Run: python3 substack_reader.py
   6. Open the generated reading.html in your browser.
 
-Dependencies: None beyond Python 3.7+ standard library.
+Dependencies: bleach, lxml (install via: pip install bleach lxml)
 """
 
 import imaplib
@@ -31,6 +31,9 @@ import sys
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+import bleach
+from lxml import html as lxml_html
+from lxml_html_clean import Cleaner
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -148,119 +151,126 @@ def extract_body_html(msg):
     return html_part, text_part
 
 
-def clean_substack_html(html_body):
+ALLOWED_TAGS = [
+    'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+    'a', 'img',
+    'blockquote', 'pre', 'code',
+    'ul', 'ol', 'li',
+    'em', 'i', 'strong', 'b', 'u', 's',
+    'br', 'hr',
+    'figure', 'figcaption',
+    'sup', 'sub',
+]
+
+ALLOWED_ATTRS = {
+    'a': ['href'],
+    'img': ['src', 'alt'],
+}
+
+
+def clean_html(html_body):
     """
-    Strip Substack email chrome (header nav, footers, share buttons, etc.)
-    and return just the article content. This is heuristic but works well.
+    Sanitize newsletter HTML down to clean, readable content.
+    Uses lxml to extract body text, then bleach to whitelist safe tags.
     """
     if not html_body:
         return ""
 
-    cleaned = html_body
+    # Parse with lxml to handle malformed HTML and extract body
+    try:
+        doc = lxml_html.fromstring(html_body)
+    except Exception:
+        return ""
 
-    # Strip email HTML structure — extract body content only
-    # Remove everything in <head>...</head>
-    cleaned = re.sub(r'<head\b[^>]*>.*?</head>', '', cleaned, flags=re.IGNORECASE | re.DOTALL)
-    # Remove <html> and <body> wrapper tags (keep inner content)
-    cleaned = re.sub(r'</?(?:html|body)\b[^>]*>', '', cleaned, flags=re.IGNORECASE)
-    # Remove <style> blocks
-    cleaned = re.sub(r'<style\b[^>]*>.*?</style>', '', cleaned, flags=re.IGNORECASE | re.DOTALL)
-    # Remove <script> blocks
-    cleaned = re.sub(r'<script\b[^>]*>.*?</script>', '', cleaned, flags=re.IGNORECASE | re.DOTALL)
-    # Remove XML declarations and doctype
-    cleaned = re.sub(r'<\?xml[^>]*\?>', '', cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r'<!DOCTYPE[^>]*>', '', cleaned, flags=re.IGNORECASE)
-    # Remove HTML comments
-    cleaned = re.sub(r'<!--.*?-->', '', cleaned, flags=re.DOTALL)
-    # Remove tracking pixels (1x1 images, hidden images)
-    cleaned = re.sub(r'<img[^>]*(?:width="1"|height="1"|display:\s*none)[^>]*/?\s*>', '', cleaned, flags=re.IGNORECASE)
-    # Remove empty elements and whitespace-only divs/spans/tds
-    cleaned = re.sub(r'<(div|span|td|tr|p)\b[^>]*>\s*</\1>', '', cleaned, flags=re.IGNORECASE)
-    # Run empty element removal a few times to catch nested empties
-    for _ in range(3):
-        cleaned = re.sub(r'<(div|span|td|tr|table|p)\b[^>]*>\s*</\1>', '', cleaned, flags=re.IGNORECASE)
-    # Remove all inline style attributes (we handle styling ourselves)
-    cleaned = re.sub(r'\s+style="[^"]*"', '', cleaned, flags=re.IGNORECASE)
-    # Remove class attributes (email-specific classes are meaningless here)
-    cleaned = re.sub(r'\s+class="[^"]*"', '', cleaned, flags=re.IGNORECASE)
-    # Remove data- attributes
-    cleaned = re.sub(r'\s+data-[a-z-]+="[^"]*"', '', cleaned, flags=re.IGNORECASE)
-    # Remove id attributes
-    cleaned = re.sub(r'\s+id="[^"]*"', '', cleaned, flags=re.IGNORECASE)
-    # Remove width/height/align/valign/bgcolor/border attributes
-    cleaned = re.sub(r'\s+(?:width|height|align|valign|bgcolor|border|cellpadding|cellspacing|role)="[^"]*"', '', cleaned, flags=re.IGNORECASE)
-    # Collapse excessive whitespace
-    cleaned = re.sub(r'\n\s*\n\s*\n', '\n\n', cleaned)
+    # Remove elements we never want
+    cleaner = Cleaner(
+        scripts=True, javascript=True, style=True, comments=True,
+        forms=True, meta=True, page_structure=True, processing_instructions=True,
+        remove_tags=['span', 'div', 'table', 'tbody', 'thead', 'tr', 'td', 'th',
+                     'font', 'center', 'section', 'article', 'header', 'footer', 'nav',
+                     'aside', 'main'],
+        kill_tags=['script', 'style', 'head', 'noscript', 'iframe', 'object', 'embed'],
+    )
+    try:
+        cleaned_doc = cleaner.clean_html(doc)
+    except Exception:
+        return ""
 
-    # Balance unclosed/extra closing tags so article content
-    # doesn't break the page structure
-    for tag in ('div', 'table', 'tr', 'td', 'span'):
-        opens = len(re.findall(rf'<{tag}\b', cleaned, re.IGNORECASE))
-        closes = len(re.findall(rf'</{tag}>', cleaned, re.IGNORECASE))
-        if closes > opens:
-            # Remove excess closing tags from the end
-            for _ in range(closes - opens):
-                idx = cleaned.rfind(f'</{tag}>')
-                if idx == -1:
-                    idx = cleaned.rfind(f'</{tag.upper()}>')
-                if idx >= 0:
-                    cleaned = cleaned[:idx] + cleaned[idx+len(f'</{tag}>'):]
-        elif opens > closes:
-            # Add missing closing tags
-            cleaned += f'</{tag}>' * (opens - closes)
+    # Serialize back to HTML string
+    raw_html = lxml_html.tostring(cleaned_doc, encoding='unicode')
 
-    # Remove common email footer/boilerplate patterns
-    # Cut at typical footer markers
-    footer_markers = [
-        r'<div[^>]*class="[^"]*footer[^"]*"',
-        r'<hr[^>]*/?>.*$',
-        r'<table[^>]*class="[^"]*post-ufi[^"]*"',  # like/comment/share bar
+    # Remove tracking pixels (1x1 images)
+    raw_html = re.sub(
+        r'<img[^>]*(?:width="1"|height="1")[^>]*/?\s*>',
+        '', raw_html, flags=re.IGNORECASE
+    )
+
+    # Remove "READ IN APP" and similar Substack CTA links
+    raw_html = re.sub(
+        r'<a[^>]*(?:read-in-app|redirect=app-store)[^>]*>.*?</a>',
+        '', raw_html, flags=re.IGNORECASE | re.DOTALL
+    )
+
+    # Remove common header boilerplate (no DOTALL — patterns should not span lines)
+    header_patterns = [
+        r'Forwarded this email\?[^<]{0,200}',
+        r'<a[^>]*>View in browser</a>',
+        r'<a[^>]*>View online</a>',
+        r'<a[^>]*>Open in app</a>',
+        r'READ IN APP',
+    ]
+    for pattern in header_patterns:
+        raw_html = re.sub(pattern, '', raw_html, count=1, flags=re.IGNORECASE)
+
+    # Cut at footer markers (only if past 30% of content)
+    footer_patterns = [
         r"You're a.*subscriber",
         r'© \d{4}',
         r'Unsubscribe',
         r'Get the app',
+        r'View in browser',
+        r'View online',
+        r'Email preferences',
+        r'Update your profile',
+        r'Manage your subscription',
+        r'Read on blog',
+        r'Read in browser',
+        r'Sent by Mailchimp',
     ]
+    for pattern in footer_patterns:
+        match = re.search(pattern, raw_html, re.IGNORECASE)
+        if match and match.start() > len(raw_html) * 0.3:
+            raw_html = raw_html[:match.start()]
 
-    for marker in footer_markers:
-        match = re.search(marker, cleaned, re.IGNORECASE | re.DOTALL)
-        if match:
-            # Only cut if we're past the halfway point of the content
-            if match.start() > len(cleaned) * 0.3:
-                cleaned = cleaned[:match.start()]
+    # Sanitize with bleach — only keep readable tags
+    cleaned = bleach.clean(
+        raw_html,
+        tags=ALLOWED_TAGS,
+        attributes=ALLOWED_ATTRS,
+        strip=True,
+    )
 
-    # Remove dangerous/unwanted links:
-    # 1. Links that wrap large blocks of content (tracking wrappers)
-    # 2. Unsubscribe/manage subscription links
-    # 3. "View in browser" links
+    # Remove empty tags left behind
+    for _ in range(3):
+        cleaned = re.sub(r'<(p|h[1-6]|blockquote|li|ul|ol|pre)\b[^>]*>\s*</\1>',
+                         '', cleaned, flags=re.IGNORECASE)
 
-    # Remove unsubscribe and management links entirely
+    # Remove unsubscribe/tracking links
     cleaned = re.sub(
-        r'<a[^>]*href="[^"]*(?:unsubscribe|manage[_-]?subscription|opt[_-]?out|email-preferences|list-manage)[^"]*"[^>]*>.*?</a>',
+        r'<a[^>]*href="[^"]*(?:unsubscribe|opt[_-]?out|email-preferences|list-manage)[^"]*"[^>]*>.*?</a>',
         '', cleaned, flags=re.IGNORECASE | re.DOTALL
     )
 
-    # Remove "view in browser" / "view online" links
-    cleaned = re.sub(
-        r'<a[^>]*href="[^"]*"[^>]*>[^<]*(?:view\s+(?:in\s+(?:your\s+)?browser|online|this\s+email))[^<]*</a>',
-        '', cleaned, flags=re.IGNORECASE
-    )
+    # Remove zero-width/invisible Unicode characters and non-breaking space padding
+    cleaned = re.sub(r'[\u200c\u200b\u200d\u034f\u00ad\ufeff\u2060\u2061\u2062\u2063\u2064]+', '', cleaned)
+    # Collapse runs of non-breaking spaces (email preheader padding)
+    cleaned = re.sub(r'(\u00a0\s*){3,}', ' ', cleaned)
+    # Remove runs of whitespace-only text between tags
+    cleaned = re.sub(r'>\s{3,}<', '><', cleaned)
+    # Collapse whitespace
+    cleaned = re.sub(r'\n\s*\n\s*\n', '\n\n', cleaned)
 
-    # Unwrap links that contain block elements or very long content (tracking wrappers)
-    # These are <a> tags wrapping entire paragraphs/divs — keep the inner content, remove the link
-    def unwrap_wrapper_links(match):
-        inner = match.group(1)
-        # If the link contains block elements, it's a wrapper — unwrap it
-        if re.search(r'<(?:p|div|table|tr|td|h[1-6]|blockquote|ul|ol|li)\b', inner, re.IGNORECASE):
-            return inner
-        # If the inner text is very long (>200 chars of text), likely a wrapper
-        text_only = re.sub(r'<[^>]+>', '', inner)
-        if len(text_only.strip()) > 200:
-            return inner
-        return match.group(0)
-
-    cleaned = re.sub(r'<a\b[^>]*>(.*?)</a>', unwrap_wrapper_links, cleaned, flags=re.DOTALL)
-
-    return cleaned
+    return cleaned.strip()
 
 
 def extract_substack_author(from_header):
@@ -367,6 +377,13 @@ def fetch_articles(cfg):
         date_str = msg["Date"]
         message_id = msg["Message-ID"] or mid_str
 
+        # Skip non-newsletter emails (verification codes, account notifications)
+        skip_subjects = ['verification code', 'confirm your email', 'reset your password',
+                         'verify your email', 'sign in to', 'login verification']
+        if any(p in subject.lower() for p in skip_subjects):
+            seen.add(mid_str)
+            continue
+
         # Parse date
         try:
             date_tuple = email.utils.parsedate_to_datetime(date_str)
@@ -375,7 +392,7 @@ def fetch_articles(cfg):
 
         author = extract_substack_author(from_hdr)
         html_body, text_body = extract_body_html(msg)
-        content_html = clean_substack_html(html_body)
+        content_html = clean_html(html_body)
 
         # If no HTML, wrap plain text in <pre>
         if not content_html and text_body:
@@ -430,54 +447,54 @@ def fetch_articles(cfg):
 
 def generate_html(articles, output_path):
     timestamp = datetime.now().strftime("%B %-d, %Y at %-I:%M %p")
+    count_str = f'{len(articles)} article{"s" if len(articles) != 1 else ""}'
+
+    from html import escape
 
     article_blocks = []
     for i, art in enumerate(articles):
         mid = art.get('message_id', f'article-{i}')
-        # Escape curly braces in content so they don't break the f-string
-        safe_content = art['content_html'].replace('{', '&#123;').replace('}', '&#125;')
-        safe_title = art['title'].replace('{', '&#123;').replace('}', '&#125;')
-        article_blocks.append(f"""
-        <article class="article" id="article-{i}" data-id="{mid}">
-            <header class="article-header">
-                <div class="article-header-row">
-                    <div>
-                        <div class="article-meta">{art['author']} · {art['date_display']}</div>
-                        <h2 class="article-title">{safe_title}</h2>
-                    </div>
-                    <button class="delete-btn" onclick="deleteArticle(this)" aria-label="Remove article" title="Remove">&times;</button>
-                </div>
-            </header>
-            <div class="article-body">
-                {safe_content}
-            </div>
-        </article>
-        """)
+        safe_title = escape(art['title'])
+        safe_author = escape(art['author'])
+        safe_mid = escape(mid, quote=True)
+        # Content is already sanitized by bleach — safe to embed directly
+        article_blocks.append(
+            f'<article class="article" id="article-{i}" data-id="{safe_mid}" style="display:none;">'
+            f'<div class="article-nav">'
+            f'<button class="back-btn" onclick="showToc()">&larr; Back</button>'
+            f'<button class="delete-btn" onclick="deleteArticle(\'{safe_mid}\')" aria-label="Remove" title="Remove">&times;</button>'
+            f'</div>'
+            f'<header class="article-header">'
+            f'<div class="article-meta">{safe_author} &middot; {art["date_display"]}</div>'
+            f'<h2 class="article-title">{safe_title}</h2>'
+            f'</header>'
+            f'<div class="article-body">'
+            f'{art["content_html"]}'
+            f'</div>'
+            f'</article>'
+        )
 
     toc_items = []
     for i, art in enumerate(articles):
         mid = art.get('message_id', f'article-{i}')
-        safe_title = art['title'].replace('{', '&#123;').replace('}', '&#125;')
+        safe_title = escape(art['title'])
+        safe_author = escape(art['author'])
+        safe_mid = escape(mid, quote=True)
         toc_items.append(
-            f'<div class="toc-item" data-toc-id="{mid}" onclick="showArticle({i})">'
-            f'<span class="toc-author">{art["author"]}</span>'
+            f'<div class="toc-item" data-toc-id="{safe_mid}" onclick="showArticle({i})">'
+            f'<span class="toc-author">{safe_author}</span>'
             f'<span class="toc-title">{safe_title}</span>'
             f'<span class="toc-date">{art["date_display"]}</span>'
             f'</div>'
         )
 
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Reading</title>
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,300;0,8..60,400;0,8..60,600;1,8..60,300;1,8..60,400&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+    toc_html = "".join(toc_items)
 
-  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+    # CSS as a raw string (no f-string escaping needed)
+    css = """<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
 
-  :root {{
+  :root {
     --bg: #f5f0e8;
     --bg-code: #ece6da;
     --text: #2c2c2c;
@@ -488,28 +505,27 @@ def generate_html(articles, output_path):
     --sans: 'IBM Plex Sans', -apple-system, sans-serif;
     --content-width: 860px;
     --toc-width: 960px;
-  }}
+  }
 
-  [data-theme="dark"] {{
+  [data-theme="dark"] {
     --bg: #1a1a1a;
     --bg-code: #252525;
     --text: #d4d0c8;
     --text-secondary: #8a8578;
     --accent: #d4785e;
     --border: #2e2e2e;
-  }}
+  }
 
-  body {{
+  body {
     font-family: var(--serif);
     background: var(--bg);
     color: var(--text);
     line-height: 1.7;
     -webkit-font-smoothing: antialiased;
     transition: background 0.3s, color 0.3s;
-  }}
+  }
 
-  /* ---------- Header ---------- */
-  .page-header {{
+  .page-header {
     max-width: var(--toc-width);
     margin: 0 auto;
     padding: 60px 32px 20px;
@@ -517,31 +533,31 @@ def generate_html(articles, output_path):
     display: flex;
     align-items: baseline;
     justify-content: space-between;
-  }}
-  .page-header h1 {{
+  }
+  .page-header h1 {
     font-family: var(--sans);
     font-size: 15px;
     font-weight: 600;
     letter-spacing: 0.08em;
     text-transform: uppercase;
     color: var(--accent);
-  }}
-  .header-right {{
+  }
+  .header-right {
     display: flex;
     align-items: center;
     gap: 16px;
-  }}
-  .page-header .timestamp {{
+  }
+  .page-header .timestamp {
     font-family: var(--sans);
     font-size: 13px;
     color: var(--text-secondary);
-  }}
-  .article-count {{
+  }
+  .article-count {
     font-family: var(--sans);
     font-size: 13px;
     color: var(--text-secondary);
-  }}
-  .theme-toggle {{
+  }
+  .theme-toggle {
     background: none;
     border: 1px solid var(--border);
     color: var(--text-secondary);
@@ -554,20 +570,19 @@ def generate_html(articles, output_path):
     display: flex;
     align-items: center;
     justify-content: center;
-  }}
-  .theme-toggle:hover {{
+  }
+  .theme-toggle:hover {
     border-color: var(--accent);
     color: var(--accent);
-  }}
+  }
 
-  /* ---------- Table of Contents ---------- */
-  .toc {{
+  .toc {
     max-width: var(--toc-width);
     margin: 0 auto;
     padding: 24px 32px 32px;
     border-bottom: 1px solid var(--border);
-  }}
-  .toc-label {{
+  }
+  .toc-label {
     font-family: var(--sans);
     font-size: 11px;
     font-weight: 600;
@@ -575,78 +590,62 @@ def generate_html(articles, output_path):
     text-transform: uppercase;
     color: var(--text-secondary);
     margin-bottom: 12px;
-  }}
-  .toc-item {{
+  }
+  .toc-item {
     display: flex;
     align-items: baseline;
     gap: 16px;
     padding: 7px 0;
-    text-decoration: none;
     color: var(--text);
     cursor: pointer;
     transition: color 0.15s;
-  }}
-  .toc-item:hover {{
-    color: var(--accent);
-  }}
-  .toc-author {{
+  }
+  .toc-item:hover { color: var(--accent); }
+  .toc-author {
     font-family: var(--sans);
     font-size: 13px;
     font-weight: 500;
     flex-shrink: 0;
     min-width: 160px;
-  }}
-  .toc-title {{
+  }
+  .toc-title {
     font-size: 15px;
     flex: 1;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }}
-  .toc-date {{
+  }
+  .toc-date {
     font-family: var(--sans);
     font-size: 12px;
     color: var(--text-secondary);
     flex-shrink: 0;
-  }}
+  }
 
-  /* ---------- Articles ---------- */
-  .articles {{
+  .article {
     max-width: var(--content-width);
     margin: 0 auto;
-    padding: 0 32px 120px;
-  }}
-
-  .article {{
-    padding: 56px 0;
-    border-bottom: 1px solid var(--border);
-  }}
-
-  .article-header {{
-    margin-bottom: 32px;
-  }}
-  .article-header-row {{
+    padding: 0 32px 80px;
+  }
+  .article-nav {
     display: flex;
     justify-content: space-between;
-    align-items: flex-start;
-    gap: 16px;
-  }}
-  .article-meta {{
+    align-items: center;
+    padding: 20px 0 0;
+  }
+  .back-btn {
     font-family: var(--sans);
-    font-size: 13px;
+    font-size: 14px;
     font-weight: 500;
-    color: var(--text-secondary);
-    margin-bottom: 8px;
-    letter-spacing: 0.01em;
-  }}
-  .article-title {{
-    font-family: var(--serif);
-    font-size: 30px;
-    font-weight: 600;
-    line-height: 1.3;
-    color: var(--text);
-  }}
-  .delete-btn {{
+    background: none;
+    border: none;
+    color: var(--accent);
+    cursor: pointer;
+    padding: 8px 0;
+    transition: opacity 0.15s;
+  }
+  .back-btn:hover { opacity: 0.7; }
+  .delete-btn {
     flex-shrink: 0;
     background: none;
     border: 1px solid var(--border);
@@ -662,49 +661,63 @@ def generate_html(articles, output_path):
     display: flex;
     align-items: center;
     justify-content: center;
-    margin-top: 4px;
-  }}
-  .delete-btn:hover {{
+  }
+  .delete-btn:hover {
     background: var(--accent);
     border-color: var(--accent);
     color: #fff;
-  }}
-
-  .article-body {{
+  }
+  .article-header {
+    padding: 24px 0 32px;
+  }
+  .article-meta {
+    font-family: var(--sans);
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    margin-bottom: 8px;
+  }
+  .article-title {
+    font-family: var(--serif);
+    font-size: 30px;
+    font-weight: 600;
+    line-height: 1.3;
+    color: var(--text);
+  }
+  .article-body {
     font-size: 19px;
     line-height: 1.8;
-  }}
-  .article-body p {{
-    margin-bottom: 1.2em;
-  }}
-  .article-body h1, .article-body h2, .article-body h3 {{
+  }
+  .article-body p { margin-bottom: 1.2em; }
+  .article-body h1, .article-body h2, .article-body h3, .article-body h4 {
     font-family: var(--serif);
     margin-top: 1.6em;
     margin-bottom: 0.6em;
     line-height: 1.3;
-  }}
-  .article-body h1 {{ font-size: 26px; }}
-  .article-body h2 {{ font-size: 22px; }}
-  .article-body h3 {{ font-size: 19px; font-weight: 600; }}
-  .article-body a {{
+  }
+  .article-body h1 { font-size: 26px; }
+  .article-body h2 { font-size: 22px; }
+  .article-body h3 { font-size: 19px; font-weight: 600; }
+  .article-body a {
     color: var(--accent);
     text-decoration-thickness: 1px;
     text-underline-offset: 3px;
-  }}
-  .article-body img {{
+  }
+  .article-body img {
     max-width: 100%;
     height: auto;
     border-radius: 6px;
     margin: 1.2em 0;
-  }}
-  .article-body blockquote {{
+    display: block;
+  }
+  .article-body blockquote {
     border-left: 3px solid var(--accent);
     padding-left: 24px;
     margin: 1.6em 0;
     color: var(--text-secondary);
     font-style: italic;
-  }}
-  .article-body pre {{
+  }
+  .article-body pre {
     background: var(--bg-code);
     padding: 16px 20px;
     border-radius: 6px;
@@ -712,52 +725,19 @@ def generate_html(articles, output_path):
     font-size: 14px;
     line-height: 1.5;
     margin: 1.2em 0;
-  }}
-  .article-body ul, .article-body ol {{
+  }
+  .article-body ul, .article-body ol {
     margin: 1em 0;
     padding-left: 1.5em;
-  }}
-  .article-body li {{
-    margin-bottom: 0.5em;
-  }}
-
-  /* Tame email HTML */
-  .article-body table {{
-    border: none !important;
-    width: 100% !important;
-  }}
-  .article-body td {{
-    border: none !important;
-    padding: 0 !important;
-  }}
-  /* Tame inline styles from email HTML */
-  .article-body * {{
-    max-width: 100% !important;
-  }}
-
-  /* ---------- Article nav ---------- */
-  .article-nav {{
-    max-width: var(--content-width);
-    margin: 0 auto;
-    padding: 20px 32px 0;
-  }}
-  .back-btn {{
-    font-family: var(--sans);
-    font-size: 14px;
-    font-weight: 500;
-    background: none;
+  }
+  .article-body li { margin-bottom: 0.5em; }
+  .article-body hr {
     border: none;
-    color: var(--accent);
-    cursor: pointer;
-    padding: 8px 0;
-    transition: opacity 0.15s;
-  }}
-  .back-btn:hover {{
-    opacity: 0.7;
-  }}
+    border-top: 1px solid var(--border);
+    margin: 2em 0;
+  }
 
-  /* ---------- Fixed controls ---------- */
-  .back-top {{
+  .back-top {
     position: fixed;
     bottom: 28px;
     right: 28px;
@@ -772,200 +752,149 @@ def generate_html(articles, output_path):
     opacity: 0;
     transition: opacity 0.3s;
     font-family: var(--sans);
-  }}
-  .back-top.visible {{
-    opacity: 1;
-  }}
+  }
+  .back-top.visible { opacity: 1; }
 
-  /* ---------- Responsive ---------- */
-  @media (max-width: 1024px) {{
-    :root {{
+  @media (max-width: 1024px) {
+    :root {
       --content-width: 100%;
       --toc-width: 100%;
-    }}
-  }}
-  @media (max-width: 600px) {{
-    .page-header {{
+    }
+  }
+  @media (max-width: 600px) {
+    .page-header {
       padding: 40px 16px 16px;
       flex-direction: column;
       gap: 12px;
-    }}
-    .header-right {{ align-self: flex-start; }}
-    .toc {{ padding: 16px 16px 24px; }}
-    .articles {{ padding: 0 16px 80px; }}
-    .article {{ padding: 36px 0; }}
-    .article-title {{ font-size: 24px; }}
-    .article-body {{ font-size: 17px; line-height: 1.75; }}
-    .article-body img {{ margin: 0.8em -16px; max-width: calc(100% + 32px); border-radius: 0; }}
-    .toc-item {{ flex-wrap: wrap; gap: 4px; }}
-    .toc-author {{ min-width: auto; }}
-    .toc-date {{ display: none; }}
-    .back-top {{ bottom: 16px; right: 16px; }}
-    .article-nav {{ padding: 16px 16px 0; }}
-  }}
-</style>
-</head>
-<body>
-  <div class="page-header">
-    <div>
-      <h1>Reading</h1>
-      <div class="timestamp">Updated {timestamp}</div>
-      <div class="article-count">{len(articles)} article{"s" if len(articles) != 1 else ""}</div>
-    </div>
-    <div class="header-right">
-      <button class="theme-toggle" onclick="toggleTheme()" aria-label="Toggle dark mode" title="Toggle dark mode">
-        <span class="theme-icon"></span>
-      </button>
-    </div>
-  </div>
+    }
+    .header-right { align-self: flex-start; }
+    .toc { padding: 16px 16px 24px; }
+    .article-title { font-size: 24px; }
+    .toc-item { flex-wrap: wrap; gap: 4px; }
+    .toc-author { min-width: auto; }
+    .toc-date { display: none; }
+    .back-top { bottom: 16px; right: 16px; }
+    .article { padding: 0 16px 60px; }
+    .article-title { font-size: 24px; }
+    .article-body { font-size: 17px; line-height: 1.75; }
+    .article-body img { margin: 0.8em -16px; max-width: calc(100% + 32px); border-radius: 0; }
+  }
+</style>"""
 
-  <div id="view-toc">
-    <nav class="toc">
-      <div class="toc-label">Contents</div>
-      {"".join(toc_items)}
-    </nav>
-  </div>
-
-  <div id="view-article" style="display:none;">
-    <div class="article-nav">
-      <button class="back-btn" onclick="showToc()">&larr; Back</button>
-    </div>
-    <main class="articles">
-      {"".join(article_blocks)}
-    </main>
-  </div>
-
-  <button class="back-top" onclick="window.scrollTo({{top:0,behavior:'smooth'}})" aria-label="Back to top">↑</button>
-
-  <script>
+    # JS as a raw string
+    js = """<script>
     const btn = document.querySelector('.back-top');
-    window.addEventListener('scroll', () => {{
+    window.addEventListener('scroll', () => {
       btn.classList.toggle('visible', window.scrollY > 400);
-    }});
+    });
 
-    // Theme toggle
-    function toggleTheme() {{
-      const html = document.documentElement;
-      const current = html.getAttribute('data-theme');
+    function toggleTheme() {
+      const current = document.documentElement.getAttribute('data-theme');
       const next = current === 'dark' ? 'light' : 'dark';
-      html.setAttribute('data-theme', next);
+      document.documentElement.setAttribute('data-theme', next);
       localStorage.setItem('substack-membrane-theme', next);
       updateThemeIcon();
-    }}
-    function updateThemeIcon() {{
+    }
+    function updateThemeIcon() {
       const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
-      document.querySelector('.theme-icon').textContent = isDark ? '\u2600' : '\u263E';
-    }}
-    // Apply saved theme on load
-    (function() {{
+      document.querySelector('.theme-icon').textContent = isDark ? '\\u2600' : '\\u263E';
+    }
+    (function() {
       const saved = localStorage.getItem('substack-membrane-theme');
-      if (saved === 'dark' || (!saved && window.matchMedia('(prefers-color-scheme: dark)').matches)) {{
+      if (saved === 'dark' || (!saved && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
         document.documentElement.setAttribute('data-theme', 'dark');
-      }}
+      }
       updateThemeIcon();
-    }})();
+    })();
 
-    // View switching — TOC vs single article
-    function showArticle(index) {{
-      console.log('[membrane] showArticle called with index:', index);
-      const tocView = document.getElementById('view-toc');
-      const articleView = document.getElementById('view-article');
-      console.log('[membrane] view-toc element:', tocView);
-      console.log('[membrane] view-article element:', articleView);
-      tocView.style.display = 'none';
-      articleView.style.display = 'block';
-      const allArticles = document.querySelectorAll('.article');
-      console.log('[membrane] total .article elements:', allArticles.length);
-      allArticles.forEach(a => a.style.display = 'none');
+    function showArticle(index) {
+      document.getElementById('view-toc').style.display = 'none';
+      document.querySelectorAll('.article').forEach(a => a.style.display = 'none');
       const target = document.getElementById('article-' + index);
-      console.log('[membrane] target article-' + index + ':', target);
-      if (target) {{
-        target.style.display = 'block';
-        const body = target.querySelector('.article-body');
-        console.log('[membrane] article body element:', body);
-        console.log('[membrane] article body innerHTML length:', body ? body.innerHTML.length : 'NO BODY');
-        console.log('[membrane] article body first 200 chars:', body ? body.innerHTML.substring(0, 200) : 'NO BODY');
-      }} else {{
-        console.error('[membrane] could not find article-' + index);
-      }}
-      window.scrollTo({{top: 0}});
-    }}
+      if (target) target.style.display = 'block';
+      window.scrollTo(0, 0);
+    }
 
-    function showToc() {{
-      console.log('[membrane] showToc called');
-      document.getElementById('view-article').style.display = 'none';
+    function showToc() {
+      document.querySelectorAll('.article').forEach(a => a.style.display = 'none');
       document.getElementById('view-toc').style.display = 'block';
-      window.scrollTo({{top: 0}});
-    }}
+      window.scrollTo(0, 0);
+    }
 
-    // Delete functionality — persists in localStorage
     const STORAGE_KEY = 'substack-membrane-deleted';
 
-    function getDeleted() {{
-      try {{ return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); }}
-      catch {{ return []; }}
-    }}
+    function getDeleted() {
+      try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); }
+      catch { return []; }
+    }
 
-    function deleteArticle(button) {{
-      const article = button.closest('.article');
-      const id = article.dataset.id;
-      article.style.transition = 'opacity 0.3s, max-height 0.4s, padding 0.4s, margin 0.4s';
-      article.style.opacity = '0';
-      article.style.overflow = 'hidden';
-      setTimeout(() => {{
-        article.style.maxHeight = '0';
-        article.style.padding = '0';
-        article.style.borderBottom = 'none';
-        setTimeout(() => article.remove(), 400);
-      }}, 300);
-
-      // Hide from TOC
-      const tocLink = document.querySelector(`[data-toc-id="${{id}}"]`);
+    function deleteArticle(id) {
+      // Remove article element
+      const articles = document.querySelectorAll('.article');
+      articles.forEach(a => { if (a.dataset.id === id) a.remove(); });
+      // Remove from TOC
+      const tocLink = document.querySelector('[data-toc-id="' + id + '"]');
       if (tocLink) tocLink.remove();
-
       // Persist
       const deleted = getDeleted();
       if (!deleted.includes(id)) deleted.push(id);
       localStorage.setItem(STORAGE_KEY, JSON.stringify(deleted));
-
-      // Update count and go back to TOC
       updateCount();
       showToc();
-    }}
+    }
 
-    function updateCount() {{
-      const remaining = document.querySelectorAll('.article').length;
+    function updateCount() {
+      const remaining = document.querySelectorAll('.toc-item').length;
       const countEl = document.querySelector('.article-count');
       if (countEl) countEl.textContent = remaining + ' article' + (remaining !== 1 ? 's' : '');
-    }}
+    }
 
-    // On load, hide previously deleted articles and log diagnostics
-    (function() {{
+    (function() {
       const deleted = getDeleted();
-      console.log('[membrane] deleted IDs from localStorage:', deleted);
-      deleted.forEach(id => {{
-        const article = document.querySelector(`.article[data-id="${{id}}"]`);
-        if (article) article.remove();
-        const tocLink = document.querySelector(`[data-toc-id="${{id}}"]`);
+      deleted.forEach(id => {
+        document.querySelectorAll('.article').forEach(a => { if (a.dataset.id === id) a.remove(); });
+        const tocLink = document.querySelector('[data-toc-id="' + id + '"]');
         if (tocLink) tocLink.remove();
-      }});
+      });
       updateCount();
+    })();
+</script>"""
 
-      // Diagnostic: check all articles
-      const allArticles = document.querySelectorAll('.article');
-      console.log('[membrane] total articles in DOM:', allArticles.length);
-      allArticles.forEach(art => {{
-        const body = art.querySelector('.article-body');
-        const title = art.querySelector('.article-title');
-        const bodyLen = body ? body.innerHTML.trim().length : -1;
-        if (bodyLen < 50) {{
-          console.warn('[membrane] EMPTY article:', art.id, 'title:', title ? title.textContent : 'NO TITLE', 'body length:', bodyLen);
-        }}
-      }});
-    }})();
-  </script>
-</body>
-</html>"""
+    articles_html = "\n".join(article_blocks)
+
+    # Assemble HTML by concatenation (no f-string — css/js contain braces)
+    parts = [
+        '<!DOCTYPE html>\n<html lang="en">\n<head>\n'
+        '<meta charset="UTF-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
+        '<title>Reading</title>\n',
+        css,
+        '\n</head>\n<body>\n'
+        '  <div class="page-header">\n'
+        '    <div>\n'
+        '      <h1>Reading</h1>\n',
+        f'      <div class="timestamp">Updated {timestamp}</div>\n'
+        f'      <div class="article-count">{count_str}</div>\n',
+        '    </div>\n'
+        '    <div class="header-right">\n'
+        '      <button class="theme-toggle" onclick="toggleTheme()" aria-label="Toggle dark mode" title="Toggle dark mode">\n'
+        '        <span class="theme-icon"></span>\n'
+        '      </button>\n'
+        '    </div>\n'
+        '  </div>\n'
+        '\n'
+        '  <div id="view-toc">\n'
+        '    <nav class="toc">\n'
+        '      <div class="toc-label">Contents</div>\n',
+        toc_html,
+        '\n    </nav>\n'
+        '  </div>\n\n',
+        articles_html,
+        '\n  <button class="back-top" onclick="window.scrollTo(0,0)" aria-label="Back to top">&uarr;</button>\n',
+        js,
+        '\n</body>\n</html>',
+    ]
+    html = "".join(parts)
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html)
