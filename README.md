@@ -2,13 +2,13 @@
 
 Pulls newsletters from your Gmail and renders them as a clean, calm reading page. No accounts, no apps, no tracking — just your email and a local HTML file.
 
-Works with Substack, NYT, WordPress, Buttondown, Patreon, and any other newsletter that lands in your inbox.
+Works with any newsletter that lands in your inbox. Substack emails get extra treatment (subtitle extraction, redirect URL decoding, avatar/icon removal), but the HTML sanitization pipeline handles all providers.
 
 ## How it works
 
 1. Connects to your Gmail over IMAP
 2. Pulls emails from a label you choose (e.g. `Newsletters`)
-3. Sanitizes HTML with bleach + lxml — strips email chrome, tracking pixels, share buttons, unsubscribe links
+3. Sanitizes HTML with bleach + lxml — strips email chrome, tracking pixels, action buttons, unsubscribe links
 4. Decodes Substack redirect URLs to actual destinations
 5. Extracts subtitles and links to original articles
 6. Generates a static HTML reading page with table of contents, dark mode, and single-article view
