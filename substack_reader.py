@@ -183,6 +183,18 @@ def clean_html(html_body):
     except Exception:
         return ""
 
+    # Add whitespace around block elements before stripping, so text doesn't run together
+    block_tags = {'div', 'td', 'tr', 'table', 'section', 'article', 'header', 'footer',
+                  'nav', 'aside', 'main', 'center'}
+    for el in doc.iter():
+        if el.tag in block_tags:
+            if el.text:
+                el.text = ' ' + el.text
+            if el.tail:
+                el.tail = ' ' + el.tail
+            else:
+                el.tail = ' '
+
     # Remove elements we never want
     cleaner = Cleaner(
         scripts=True, javascript=True, style=True, comments=True,
@@ -206,28 +218,26 @@ def clean_html(html_body):
         '', raw_html, flags=re.IGNORECASE
     )
 
-    # Remove "READ IN APP" and similar Substack CTA links
+    # Remove small Substack UI icons (forward, restack, arrow icons — 36px or smaller)
     raw_html = re.sub(
-        r'<a[^>]*(?:read-in-app|redirect=app-store)[^>]*>.*?</a>',
-        '', raw_html, flags=re.IGNORECASE | re.DOTALL
+        r'<img[^>]*src="[^"]*substack\.com/icon/[^"]*"[^>]*/?\s*>',
+        '', raw_html, flags=re.IGNORECASE
     )
 
-    # Remove common header boilerplate (no DOTALL — patterns should not span lines)
-    header_patterns = [
-        r'Forwarded this email\?[^<]{0,200}',
-        r'<a[^>]*>View in browser</a>',
-        r'<a[^>]*>View online</a>',
-        r'<a[^>]*>Open in app</a>',
-        r'READ IN APP',
-    ]
-    for pattern in header_patterns:
-        raw_html = re.sub(pattern, '', raw_html, count=1, flags=re.IGNORECASE)
+    # Remove Substack app-link URLs BEFORE bleach (bleach strips complex URLs containing these patterns)
+    raw_html = re.sub(
+        r'<a[^>]*href="[^"]*(?:substack\.com/app-link|read-in-app|redirect=app-store|restack-comment|email-checkout)[^"]*"[^>]*>.*?</a>',
+        '', raw_html, flags=re.IGNORECASE | re.DOTALL
+    )
 
     # Cut at footer markers — only high-confidence patterns that won't match article text
     # Search from the END of the document to find the actual footer, not content matches
     footer_patterns = [
-        # Substack-specific footer (very precise)
+        # Substack-specific footers (very precise)
         (r"You're (?:currently )?a (?:free|paid) subscriber to\b", 0.5),
+        (r"You're on the (?:free|paid) list for\b", 0.5),
+        (r'A subscription gets you:', 0.7),
+        (r'Upgrade to paid', 0.8),
         # Generic newsletter footers (require being in last 30% of content)
         (r'© \d{4}', 0.7),
         (r'Unsubscribe', 0.7),
@@ -250,19 +260,9 @@ def clean_html(html_body):
         strip=True,
     )
 
-    # Strip Substack email header boilerplate (after bleach so tags don't interfere):
-    # Keep the subtitle (before "Subscribe here"), cut from "Subscribe here" through author+date
-    month_pattern = r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}'
-    substack_header = re.search(
-        r'Subscribe here(?:</a>)? for more.*?' + month_pattern,
-        cleaned, flags=re.IGNORECASE | re.DOTALL
-    )
-    if substack_header and substack_header.start() < len(cleaned) * 0.3:
-        cleaned = cleaned[:substack_header.start()] + cleaned[substack_header.end():]
-
     # Remove empty tags left behind
     for _ in range(3):
-        cleaned = re.sub(r'<(p|h[1-6]|blockquote|li|ul|ol|pre)\b[^>]*>\s*</\1>',
+        cleaned = re.sub(r'<(p|h[1-6]|blockquote|li|ul|ol|pre|figure|figcaption)\b[^>]*>[\s\u00a0]*</\1>',
                          '', cleaned, flags=re.IGNORECASE)
 
     # Remove unsubscribe/tracking links
@@ -271,10 +271,10 @@ def clean_html(html_body):
         '', cleaned, flags=re.IGNORECASE | re.DOTALL
     )
 
-    # Remove Substack app-link URLs (like/comment/restack buttons)
+    # Fallback: remove any remaining Restack/READ IN APP links by link text (in case bleach stripped the URL)
     cleaned = re.sub(
-        r'<a[^>]*href="[^"]*substack\.com/app-link[^"]*"[^>]*>.*?</a>',
-        '', cleaned, flags=re.IGNORECASE | re.DOTALL
+        r'<a[^>]*>\s*Restack\s*</a>',
+        '', cleaned, flags=re.IGNORECASE
     )
 
     # Decode Substack type-2 redirect URLs to actual destinations
@@ -334,6 +334,11 @@ def clean_html(html_body):
     cleaned = re.sub(r'>\s{3,}<', '><', cleaned)
     # Collapse whitespace
     cleaned = re.sub(r'\n\s*\n\s*\n', '\n\n', cleaned)
+
+    # Final pass: remove empty tags created by link/image cleanup above
+    for _ in range(3):
+        cleaned = re.sub(r'<(p|h[1-6]|blockquote|li|ul|ol|pre|figure|figcaption)\b[^>]*>[\s\u00a0]*</\1>',
+                         '', cleaned, flags=re.IGNORECASE)
 
     return cleaned.strip()
 
@@ -490,25 +495,9 @@ def fetch_articles(cfg):
             seen.add(mid_str)
             continue
 
-        # Extract subtitle (text before first <p> tag) for Substack articles
-        subtitle = ""
-        pre_match = re.match(r'^(.*?)(<p\b)', content_html, re.DOTALL)
-        if pre_match:
-            sub_text = re.sub(r'<[^>]+>', ' ', pre_match.group(1)).strip()
-            sub_text = re.sub(r'\s+', ' ', sub_text)
-            # Clean up subtitle boilerplate
-            sub_text = re.sub(r'\|.*$', '', sub_text).strip()  # remove "| nytimes.com" etc.
-            sub_text = re.sub(r'^(?:Listen|Watch|Read) now \(\d+ mins?\)\s*', '', sub_text).strip()
-            # Only use as subtitle if it's a reasonable length and not just "..."
-            if 5 < len(sub_text) < 300 and sub_text not in ('...', '·'):
-                subtitle = sub_text
-                # Remove the subtitle text, keep from the <p> tag onward
-                content_html = content_html[pre_match.start(2):]
-
         articles.append({
             "title": subject,
             "author": author,
-            "subtitle": subtitle,
             "date": date_tuple.isoformat(),
             "date_display": date_tuple.strftime("%B %-d, %Y"),
             "content_html": content_html,
@@ -574,7 +563,6 @@ def generate_html(articles, output_path):
             + (f' &middot; <a href="{escape(art["original_url"], quote=True)}" class="original-link" target="_blank">View original</a>' if art.get("original_url") else '')
             + f'</div>'
             f'<h2 class="article-title">{safe_title}</h2>'
-            + (f'<p class="article-subtitle">{escape(art["subtitle"])}</p>' if art.get("subtitle") else '')
             + f'</header>'
             f'<div class="article-body">'
             f'{art["content_html"]}'
@@ -803,15 +791,6 @@ def generate_html(articles, output_path):
     line-height: 1.2;
     letter-spacing: -0.02em;
     color: var(--text);
-  }
-  .article-subtitle {
-    font-family: var(--serif);
-    font-size: 19px;
-    font-weight: 300;
-    line-height: 1.5;
-    color: var(--text-secondary);
-    margin-top: 10px;
-    font-style: italic;
   }
   .article-body {
     font-size: 19px;
