@@ -21,6 +21,7 @@ Setup:
 Dependencies: bleach, lxml (install via: pip install bleach lxml)
 """
 
+import base64
 import imaplib
 import email
 from email.header import decode_header
@@ -222,25 +223,24 @@ def clean_html(html_body):
     for pattern in header_patterns:
         raw_html = re.sub(pattern, '', raw_html, count=1, flags=re.IGNORECASE)
 
-    # Cut at footer markers (only if past 30% of content)
+    # Cut at footer markers — only high-confidence patterns that won't match article text
+    # Search from the END of the document to find the actual footer, not content matches
     footer_patterns = [
-        r"You're a.*subscriber",
-        r'© \d{4}',
-        r'Unsubscribe',
-        r'Get the app',
-        r'View in browser',
-        r'View online',
-        r'Email preferences',
-        r'Update your profile',
-        r'Manage your subscription',
-        r'Read on blog',
-        r'Read in browser',
-        r'Sent by Mailchimp',
+        # Substack-specific footer (very precise)
+        (r"You're (?:currently )?a (?:free|paid) subscriber to\b", 0.5),
+        # Generic newsletter footers (require being in last 30% of content)
+        (r'© \d{4}', 0.7),
+        (r'Unsubscribe', 0.7),
+        (r'Email preferences', 0.7),
+        (r'Update your profile', 0.7),
+        (r'Manage your subscription', 0.7),
+        (r'Sent by Mailchimp', 0.7),
     ]
-    for pattern in footer_patterns:
+    for pattern, min_pct in footer_patterns:
         match = re.search(pattern, raw_html, re.IGNORECASE)
-        if match and match.start() > len(raw_html) * 0.3:
+        if match and match.start() > len(raw_html) * min_pct:
             raw_html = raw_html[:match.start()]
+            break  # Only cut once at the earliest footer match
 
     # Sanitize with bleach — only keep readable tags
     cleaned = bleach.clean(
@@ -275,6 +275,32 @@ def clean_html(html_body):
     cleaned = re.sub(
         r'<a[^>]*href="[^"]*substack\.com/app-link[^"]*"[^>]*>.*?</a>',
         '', cleaned, flags=re.IGNORECASE | re.DOTALL
+    )
+
+    # Decode Substack type-2 redirect URLs to actual destinations
+    def decode_redirect_url(redirect_url):
+        m = re.search(r'substack\.com/redirect/2/([^"?&]+)', redirect_url)
+        if not m:
+            return redirect_url
+        try:
+            payload = m.group(1).split('.')[0]
+            payload += '=' * (4 - len(payload) % 4)
+            data = json.loads(base64.urlsafe_b64decode(payload))
+            return data.get('e', redirect_url)
+        except Exception:
+            return redirect_url
+
+    def replace_redirect_href(m):
+        old_url = m.group(1)
+        new_url = decode_redirect_url(old_url)
+        if new_url != old_url:
+            return m.group(0).replace(old_url, new_url.replace('&', '&amp;'))
+        return m.group(0)
+
+    cleaned = re.sub(
+        r'<a([^>]*)href="(https?://substack\.com/redirect/2/[^"]+)"',
+        lambda m: f'<a{m.group(1)}href="{decode_redirect_url(m.group(2)).replace(chr(38), "&amp;")}"',
+        cleaned, flags=re.IGNORECASE
     )
 
     # Unwrap Substack image links (keep images, drop the wrapping <a> tag)
@@ -466,7 +492,7 @@ def fetch_articles(cfg):
 
         # Extract subtitle (text before first <p> tag) for Substack articles
         subtitle = ""
-        pre_match = re.match(r'^(.*?)\s*<p\b', content_html, re.DOTALL)
+        pre_match = re.match(r'^(.*?)(<p\b)', content_html, re.DOTALL)
         if pre_match:
             sub_text = re.sub(r'<[^>]+>', ' ', pre_match.group(1)).strip()
             sub_text = re.sub(r'\s+', ' ', sub_text)
@@ -476,9 +502,8 @@ def fetch_articles(cfg):
             # Only use as subtitle if it's a reasonable length and not just "..."
             if 5 < len(sub_text) < 300 and sub_text not in ('...', '·'):
                 subtitle = sub_text
-                # Remove the subtitle text from content body
-                content_html = content_html[pre_match.end() - 2:]  # keep the <p
-                content_html = '<p' + content_html
+                # Remove the subtitle text, keep from the <p> tag onward
+                content_html = content_html[pre_match.start(2):]
 
         articles.append({
             "title": subject,
