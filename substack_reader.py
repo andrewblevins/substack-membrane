@@ -183,6 +183,12 @@ def clean_html(html_body):
     except Exception:
         return ""
 
+    # For Substack emails, extract the "body markup" div which contains only article content,
+    # skipping all email header chrome (subtitle, author, date, cross-post info, avatars)
+    body_markup = doc.find('.//*[@class="body markup"]')
+    if body_markup is not None:
+        doc = body_markup
+
     # Add whitespace around block elements before stripping, so text doesn't run together
     block_tags = {'div', 'td', 'tr', 'table', 'section', 'article', 'header', 'footer',
                   'nav', 'aside', 'main', 'center'}
