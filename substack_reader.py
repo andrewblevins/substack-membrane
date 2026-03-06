@@ -156,25 +156,109 @@ def clean_substack_html(html_body):
     if not html_body:
         return ""
 
-    # Remove common Substack email footer/boilerplate patterns
+    cleaned = html_body
+
+    # Strip email HTML structure — extract body content only
+    # Remove everything in <head>...</head>
+    cleaned = re.sub(r'<head\b[^>]*>.*?</head>', '', cleaned, flags=re.IGNORECASE | re.DOTALL)
+    # Remove <html> and <body> wrapper tags (keep inner content)
+    cleaned = re.sub(r'</?(?:html|body)\b[^>]*>', '', cleaned, flags=re.IGNORECASE)
+    # Remove <style> blocks
+    cleaned = re.sub(r'<style\b[^>]*>.*?</style>', '', cleaned, flags=re.IGNORECASE | re.DOTALL)
+    # Remove <script> blocks
+    cleaned = re.sub(r'<script\b[^>]*>.*?</script>', '', cleaned, flags=re.IGNORECASE | re.DOTALL)
+    # Remove XML declarations and doctype
+    cleaned = re.sub(r'<\?xml[^>]*\?>', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'<!DOCTYPE[^>]*>', '', cleaned, flags=re.IGNORECASE)
+    # Remove HTML comments
+    cleaned = re.sub(r'<!--.*?-->', '', cleaned, flags=re.DOTALL)
+    # Remove tracking pixels (1x1 images, hidden images)
+    cleaned = re.sub(r'<img[^>]*(?:width="1"|height="1"|display:\s*none)[^>]*/?\s*>', '', cleaned, flags=re.IGNORECASE)
+    # Remove empty elements and whitespace-only divs/spans/tds
+    cleaned = re.sub(r'<(div|span|td|tr|p)\b[^>]*>\s*</\1>', '', cleaned, flags=re.IGNORECASE)
+    # Run empty element removal a few times to catch nested empties
+    for _ in range(3):
+        cleaned = re.sub(r'<(div|span|td|tr|table|p)\b[^>]*>\s*</\1>', '', cleaned, flags=re.IGNORECASE)
+    # Remove all inline style attributes (we handle styling ourselves)
+    cleaned = re.sub(r'\s+style="[^"]*"', '', cleaned, flags=re.IGNORECASE)
+    # Remove class attributes (email-specific classes are meaningless here)
+    cleaned = re.sub(r'\s+class="[^"]*"', '', cleaned, flags=re.IGNORECASE)
+    # Remove data- attributes
+    cleaned = re.sub(r'\s+data-[a-z-]+="[^"]*"', '', cleaned, flags=re.IGNORECASE)
+    # Remove id attributes
+    cleaned = re.sub(r'\s+id="[^"]*"', '', cleaned, flags=re.IGNORECASE)
+    # Remove width/height/align/valign/bgcolor/border attributes
+    cleaned = re.sub(r'\s+(?:width|height|align|valign|bgcolor|border|cellpadding|cellspacing|role)="[^"]*"', '', cleaned, flags=re.IGNORECASE)
+    # Collapse excessive whitespace
+    cleaned = re.sub(r'\n\s*\n\s*\n', '\n\n', cleaned)
+
+    # Balance unclosed/extra closing tags so article content
+    # doesn't break the page structure
+    for tag in ('div', 'table', 'tr', 'td', 'span'):
+        opens = len(re.findall(rf'<{tag}\b', cleaned, re.IGNORECASE))
+        closes = len(re.findall(rf'</{tag}>', cleaned, re.IGNORECASE))
+        if closes > opens:
+            # Remove excess closing tags from the end
+            for _ in range(closes - opens):
+                idx = cleaned.rfind(f'</{tag}>')
+                if idx == -1:
+                    idx = cleaned.rfind(f'</{tag.upper()}>')
+                if idx >= 0:
+                    cleaned = cleaned[:idx] + cleaned[idx+len(f'</{tag}>'):]
+        elif opens > closes:
+            # Add missing closing tags
+            cleaned += f'</{tag}>' * (opens - closes)
+
+    # Remove common email footer/boilerplate patterns
     # Cut at typical footer markers
     footer_markers = [
         r'<div[^>]*class="[^"]*footer[^"]*"',
         r'<hr[^>]*/?>.*$',
         r'<table[^>]*class="[^"]*post-ufi[^"]*"',  # like/comment/share bar
-        r'You're a.*subscriber',
+        r"You're a.*subscriber",
         r'© \d{4}',
         r'Unsubscribe',
         r'Get the app',
     ]
 
-    cleaned = html_body
     for marker in footer_markers:
         match = re.search(marker, cleaned, re.IGNORECASE | re.DOTALL)
         if match:
             # Only cut if we're past the halfway point of the content
             if match.start() > len(cleaned) * 0.3:
                 cleaned = cleaned[:match.start()]
+
+    # Remove dangerous/unwanted links:
+    # 1. Links that wrap large blocks of content (tracking wrappers)
+    # 2. Unsubscribe/manage subscription links
+    # 3. "View in browser" links
+
+    # Remove unsubscribe and management links entirely
+    cleaned = re.sub(
+        r'<a[^>]*href="[^"]*(?:unsubscribe|manage[_-]?subscription|opt[_-]?out|email-preferences|list-manage)[^"]*"[^>]*>.*?</a>',
+        '', cleaned, flags=re.IGNORECASE | re.DOTALL
+    )
+
+    # Remove "view in browser" / "view online" links
+    cleaned = re.sub(
+        r'<a[^>]*href="[^"]*"[^>]*>[^<]*(?:view\s+(?:in\s+(?:your\s+)?browser|online|this\s+email))[^<]*</a>',
+        '', cleaned, flags=re.IGNORECASE
+    )
+
+    # Unwrap links that contain block elements or very long content (tracking wrappers)
+    # These are <a> tags wrapping entire paragraphs/divs — keep the inner content, remove the link
+    def unwrap_wrapper_links(match):
+        inner = match.group(1)
+        # If the link contains block elements, it's a wrapper — unwrap it
+        if re.search(r'<(?:p|div|table|tr|td|h[1-6]|blockquote|ul|ol|li)\b', inner, re.IGNORECASE):
+            return inner
+        # If the inner text is very long (>200 chars of text), likely a wrapper
+        text_only = re.sub(r'<[^>]+>', '', inner)
+        if len(text_only.strip()) > 200:
+            return inner
+        return match.group(0)
+
+    cleaned = re.sub(r'<a\b[^>]*>(.*?)</a>', unwrap_wrapper_links, cleaned, flags=re.DOTALL)
 
     return cleaned
 
@@ -246,8 +330,8 @@ def fetch_articles(cfg):
     search_location = f"label '{label}'" if label else "INBOX"
     print(f"Searching {search_location} for Substack emails...")
 
-    # Search for emails from substack.com
-    status, data = mail.search(None, '(FROM "substack.com")')
+    # Search for all emails in this mailbox/label
+    status, data = mail.search(None, "ALL")
     if status != "OK":
         print("Search failed.")
         return []
@@ -277,12 +361,6 @@ def fetch_articles(cfg):
 
         raw = msg_data[0][1]
         msg = email.message_from_bytes(raw)
-
-        # Filter: only newsletter posts, not reader interactions
-        if not is_newsletter_post(msg):
-            skipped_notifications += 1
-            seen.add(mid_str)  # don't re-check next time
-            continue
 
         subject = decode_mime_header(msg["Subject"])
         from_hdr = decode_mime_header(msg["From"])
@@ -355,26 +433,37 @@ def generate_html(articles, output_path):
 
     article_blocks = []
     for i, art in enumerate(articles):
+        mid = art.get('message_id', f'article-{i}')
+        # Escape curly braces in content so they don't break the f-string
+        safe_content = art['content_html'].replace('{', '&#123;').replace('}', '&#125;')
+        safe_title = art['title'].replace('{', '&#123;').replace('}', '&#125;')
         article_blocks.append(f"""
-        <article class="article" id="article-{i}">
+        <article class="article" id="article-{i}" data-id="{mid}">
             <header class="article-header">
-                <div class="article-meta">{art['author']} · {art['date_display']}</div>
-                <h2 class="article-title">{art['title']}</h2>
+                <div class="article-header-row">
+                    <div>
+                        <div class="article-meta">{art['author']} · {art['date_display']}</div>
+                        <h2 class="article-title">{safe_title}</h2>
+                    </div>
+                    <button class="delete-btn" onclick="deleteArticle(this)" aria-label="Remove article" title="Remove">&times;</button>
+                </div>
             </header>
             <div class="article-body">
-                {art['content_html']}
+                {safe_content}
             </div>
         </article>
         """)
 
     toc_items = []
     for i, art in enumerate(articles):
+        mid = art.get('message_id', f'article-{i}')
+        safe_title = art['title'].replace('{', '&#123;').replace('}', '&#125;')
         toc_items.append(
-            f'<a class="toc-item" href="#article-{i}">'
+            f'<div class="toc-item" data-toc-id="{mid}" onclick="showArticle({i})">'
             f'<span class="toc-author">{art["author"]}</span>'
-            f'<span class="toc-title">{art["title"]}</span>'
+            f'<span class="toc-title">{safe_title}</span>'
             f'<span class="toc-date">{art["date_display"]}</span>'
-            f'</a>'
+            f'</div>'
         )
 
     html = f"""<!DOCTYPE html>
@@ -389,14 +478,25 @@ def generate_html(articles, output_path):
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
 
   :root {{
-    --bg: #faf8f4;
-    --bg-card: #ffffff;
+    --bg: #f5f0e8;
+    --bg-code: #ece6da;
     --text: #2c2c2c;
-    --text-secondary: #6b6b6b;
+    --text-secondary: #7a7368;
     --accent: #b44a2d;
-    --border: #e8e4de;
+    --border: #ddd6cb;
     --serif: 'Source Serif 4', Georgia, serif;
     --sans: 'IBM Plex Sans', -apple-system, sans-serif;
+    --content-width: 860px;
+    --toc-width: 960px;
+  }}
+
+  [data-theme="dark"] {{
+    --bg: #1a1a1a;
+    --bg-code: #252525;
+    --text: #d4d0c8;
+    --text-secondary: #8a8578;
+    --accent: #d4785e;
+    --border: #2e2e2e;
   }}
 
   body {{
@@ -405,14 +505,18 @@ def generate_html(articles, output_path):
     color: var(--text);
     line-height: 1.7;
     -webkit-font-smoothing: antialiased;
+    transition: background 0.3s, color 0.3s;
   }}
 
   /* ---------- Header ---------- */
   .page-header {{
-    max-width: 720px;
+    max-width: var(--toc-width);
     margin: 0 auto;
-    padding: 60px 24px 20px;
+    padding: 60px 32px 20px;
     border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
   }}
   .page-header h1 {{
     font-family: var(--sans);
@@ -422,24 +526,45 @@ def generate_html(articles, output_path):
     text-transform: uppercase;
     color: var(--accent);
   }}
+  .header-right {{
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }}
   .page-header .timestamp {{
     font-family: var(--sans);
     font-size: 13px;
     color: var(--text-secondary);
-    margin-top: 4px;
   }}
   .article-count {{
     font-family: var(--sans);
     font-size: 13px;
     color: var(--text-secondary);
-    margin-top: 2px;
+  }}
+  .theme-toggle {{
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    font-size: 16px;
+    cursor: pointer;
+    transition: all 0.2s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }}
+  .theme-toggle:hover {{
+    border-color: var(--accent);
+    color: var(--accent);
   }}
 
   /* ---------- Table of Contents ---------- */
   .toc {{
-    max-width: 720px;
+    max-width: var(--toc-width);
     margin: 0 auto;
-    padding: 24px 24px 32px;
+    padding: 24px 32px 32px;
     border-bottom: 1px solid var(--border);
   }}
   .toc-label {{
@@ -454,10 +579,11 @@ def generate_html(articles, output_path):
   .toc-item {{
     display: flex;
     align-items: baseline;
-    gap: 12px;
-    padding: 6px 0;
+    gap: 16px;
+    padding: 7px 0;
     text-decoration: none;
     color: var(--text);
+    cursor: pointer;
     transition: color 0.15s;
   }}
   .toc-item:hover {{
@@ -468,7 +594,7 @@ def generate_html(articles, output_path):
     font-size: 13px;
     font-weight: 500;
     flex-shrink: 0;
-    min-width: 140px;
+    min-width: 160px;
   }}
   .toc-title {{
     font-size: 15px;
@@ -486,18 +612,24 @@ def generate_html(articles, output_path):
 
   /* ---------- Articles ---------- */
   .articles {{
-    max-width: 720px;
+    max-width: var(--content-width);
     margin: 0 auto;
-    padding: 0 24px 120px;
+    padding: 0 32px 120px;
   }}
 
   .article {{
-    padding: 48px 0;
+    padding: 56px 0;
     border-bottom: 1px solid var(--border);
   }}
 
   .article-header {{
-    margin-bottom: 28px;
+    margin-bottom: 32px;
+  }}
+  .article-header-row {{
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
   }}
   .article-meta {{
     font-family: var(--sans);
@@ -509,14 +641,37 @@ def generate_html(articles, output_path):
   }}
   .article-title {{
     font-family: var(--serif);
-    font-size: 28px;
+    font-size: 30px;
     font-weight: 600;
     line-height: 1.3;
     color: var(--text);
   }}
+  .delete-btn {{
+    flex-shrink: 0;
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    font-size: 18px;
+    cursor: pointer;
+    transition: all 0.15s;
+    font-family: var(--sans);
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-top: 4px;
+  }}
+  .delete-btn:hover {{
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }}
 
   .article-body {{
-    font-size: 18px;
+    font-size: 19px;
     line-height: 1.8;
   }}
   .article-body p {{
@@ -528,30 +683,30 @@ def generate_html(articles, output_path):
     margin-bottom: 0.6em;
     line-height: 1.3;
   }}
-  .article-body h1 {{ font-size: 24px; }}
-  .article-body h2 {{ font-size: 21px; }}
-  .article-body h3 {{ font-size: 18px; font-weight: 600; }}
+  .article-body h1 {{ font-size: 26px; }}
+  .article-body h2 {{ font-size: 22px; }}
+  .article-body h3 {{ font-size: 19px; font-weight: 600; }}
   .article-body a {{
     color: var(--accent);
     text-decoration-thickness: 1px;
-    text-underline-offset: 2px;
+    text-underline-offset: 3px;
   }}
   .article-body img {{
     max-width: 100%;
     height: auto;
-    border-radius: 4px;
-    margin: 1em 0;
+    border-radius: 6px;
+    margin: 1.2em 0;
   }}
   .article-body blockquote {{
     border-left: 3px solid var(--accent);
-    padding-left: 20px;
-    margin: 1.4em 0;
+    padding-left: 24px;
+    margin: 1.6em 0;
     color: var(--text-secondary);
     font-style: italic;
   }}
   .article-body pre {{
-    background: #f4f1ec;
-    padding: 16px;
+    background: var(--bg-code);
+    padding: 16px 20px;
     border-radius: 6px;
     overflow-x: auto;
     font-size: 14px;
@@ -563,10 +718,10 @@ def generate_html(articles, output_path):
     padding-left: 1.5em;
   }}
   .article-body li {{
-    margin-bottom: 0.4em;
+    margin-bottom: 0.5em;
   }}
 
-  /* Substack email images and containers — tame them */
+  /* Tame email HTML */
   .article-body table {{
     border: none !important;
     width: 100% !important;
@@ -575,8 +730,33 @@ def generate_html(articles, output_path):
     border: none !important;
     padding: 0 !important;
   }}
+  /* Tame inline styles from email HTML */
+  .article-body * {{
+    max-width: 100% !important;
+  }}
 
-  /* ---------- Back to top ---------- */
+  /* ---------- Article nav ---------- */
+  .article-nav {{
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: 20px 32px 0;
+  }}
+  .back-btn {{
+    font-family: var(--sans);
+    font-size: 14px;
+    font-weight: 500;
+    background: none;
+    border: none;
+    color: var(--accent);
+    cursor: pointer;
+    padding: 8px 0;
+    transition: opacity 0.15s;
+  }}
+  .back-btn:hover {{
+    opacity: 0.7;
+  }}
+
+  /* ---------- Fixed controls ---------- */
   .back-top {{
     position: fixed;
     bottom: 28px;
@@ -598,33 +778,62 @@ def generate_html(articles, output_path):
   }}
 
   /* ---------- Responsive ---------- */
+  @media (max-width: 1024px) {{
+    :root {{
+      --content-width: 100%;
+      --toc-width: 100%;
+    }}
+  }}
   @media (max-width: 600px) {{
-    .page-header {{ padding: 40px 16px 16px; }}
+    .page-header {{
+      padding: 40px 16px 16px;
+      flex-direction: column;
+      gap: 12px;
+    }}
+    .header-right {{ align-self: flex-start; }}
     .toc {{ padding: 16px 16px 24px; }}
     .articles {{ padding: 0 16px 80px; }}
-    .article-title {{ font-size: 22px; }}
-    .article-body {{ font-size: 17px; }}
+    .article {{ padding: 36px 0; }}
+    .article-title {{ font-size: 24px; }}
+    .article-body {{ font-size: 17px; line-height: 1.75; }}
+    .article-body img {{ margin: 0.8em -16px; max-width: calc(100% + 32px); border-radius: 0; }}
     .toc-item {{ flex-wrap: wrap; gap: 4px; }}
     .toc-author {{ min-width: auto; }}
     .toc-date {{ display: none; }}
+    .back-top {{ bottom: 16px; right: 16px; }}
+    .article-nav {{ padding: 16px 16px 0; }}
   }}
 </style>
 </head>
 <body>
   <div class="page-header">
-    <h1>Reading</h1>
-    <div class="timestamp">Updated {timestamp}</div>
-    <div class="article-count">{len(articles)} article{"s" if len(articles) != 1 else ""}</div>
+    <div>
+      <h1>Reading</h1>
+      <div class="timestamp">Updated {timestamp}</div>
+      <div class="article-count">{len(articles)} article{"s" if len(articles) != 1 else ""}</div>
+    </div>
+    <div class="header-right">
+      <button class="theme-toggle" onclick="toggleTheme()" aria-label="Toggle dark mode" title="Toggle dark mode">
+        <span class="theme-icon"></span>
+      </button>
+    </div>
   </div>
 
-  <nav class="toc">
-    <div class="toc-label">Contents</div>
-    {"".join(toc_items)}
-  </nav>
+  <div id="view-toc">
+    <nav class="toc">
+      <div class="toc-label">Contents</div>
+      {"".join(toc_items)}
+    </nav>
+  </div>
 
-  <main class="articles">
-    {"".join(article_blocks)}
-  </main>
+  <div id="view-article" style="display:none;">
+    <div class="article-nav">
+      <button class="back-btn" onclick="showToc()">&larr; Back</button>
+    </div>
+    <main class="articles">
+      {"".join(article_blocks)}
+    </main>
+  </div>
 
   <button class="back-top" onclick="window.scrollTo({{top:0,behavior:'smooth'}})" aria-label="Back to top">↑</button>
 
@@ -633,6 +842,127 @@ def generate_html(articles, output_path):
     window.addEventListener('scroll', () => {{
       btn.classList.toggle('visible', window.scrollY > 400);
     }});
+
+    // Theme toggle
+    function toggleTheme() {{
+      const html = document.documentElement;
+      const current = html.getAttribute('data-theme');
+      const next = current === 'dark' ? 'light' : 'dark';
+      html.setAttribute('data-theme', next);
+      localStorage.setItem('substack-membrane-theme', next);
+      updateThemeIcon();
+    }}
+    function updateThemeIcon() {{
+      const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+      document.querySelector('.theme-icon').textContent = isDark ? '\u2600' : '\u263E';
+    }}
+    // Apply saved theme on load
+    (function() {{
+      const saved = localStorage.getItem('substack-membrane-theme');
+      if (saved === 'dark' || (!saved && window.matchMedia('(prefers-color-scheme: dark)').matches)) {{
+        document.documentElement.setAttribute('data-theme', 'dark');
+      }}
+      updateThemeIcon();
+    }})();
+
+    // View switching — TOC vs single article
+    function showArticle(index) {{
+      console.log('[membrane] showArticle called with index:', index);
+      const tocView = document.getElementById('view-toc');
+      const articleView = document.getElementById('view-article');
+      console.log('[membrane] view-toc element:', tocView);
+      console.log('[membrane] view-article element:', articleView);
+      tocView.style.display = 'none';
+      articleView.style.display = 'block';
+      const allArticles = document.querySelectorAll('.article');
+      console.log('[membrane] total .article elements:', allArticles.length);
+      allArticles.forEach(a => a.style.display = 'none');
+      const target = document.getElementById('article-' + index);
+      console.log('[membrane] target article-' + index + ':', target);
+      if (target) {{
+        target.style.display = 'block';
+        const body = target.querySelector('.article-body');
+        console.log('[membrane] article body element:', body);
+        console.log('[membrane] article body innerHTML length:', body ? body.innerHTML.length : 'NO BODY');
+        console.log('[membrane] article body first 200 chars:', body ? body.innerHTML.substring(0, 200) : 'NO BODY');
+      }} else {{
+        console.error('[membrane] could not find article-' + index);
+      }}
+      window.scrollTo({{top: 0}});
+    }}
+
+    function showToc() {{
+      console.log('[membrane] showToc called');
+      document.getElementById('view-article').style.display = 'none';
+      document.getElementById('view-toc').style.display = 'block';
+      window.scrollTo({{top: 0}});
+    }}
+
+    // Delete functionality — persists in localStorage
+    const STORAGE_KEY = 'substack-membrane-deleted';
+
+    function getDeleted() {{
+      try {{ return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); }}
+      catch {{ return []; }}
+    }}
+
+    function deleteArticle(button) {{
+      const article = button.closest('.article');
+      const id = article.dataset.id;
+      article.style.transition = 'opacity 0.3s, max-height 0.4s, padding 0.4s, margin 0.4s';
+      article.style.opacity = '0';
+      article.style.overflow = 'hidden';
+      setTimeout(() => {{
+        article.style.maxHeight = '0';
+        article.style.padding = '0';
+        article.style.borderBottom = 'none';
+        setTimeout(() => article.remove(), 400);
+      }}, 300);
+
+      // Hide from TOC
+      const tocLink = document.querySelector(`[data-toc-id="${{id}}"]`);
+      if (tocLink) tocLink.remove();
+
+      // Persist
+      const deleted = getDeleted();
+      if (!deleted.includes(id)) deleted.push(id);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(deleted));
+
+      // Update count and go back to TOC
+      updateCount();
+      showToc();
+    }}
+
+    function updateCount() {{
+      const remaining = document.querySelectorAll('.article').length;
+      const countEl = document.querySelector('.article-count');
+      if (countEl) countEl.textContent = remaining + ' article' + (remaining !== 1 ? 's' : '');
+    }}
+
+    // On load, hide previously deleted articles and log diagnostics
+    (function() {{
+      const deleted = getDeleted();
+      console.log('[membrane] deleted IDs from localStorage:', deleted);
+      deleted.forEach(id => {{
+        const article = document.querySelector(`.article[data-id="${{id}}"]`);
+        if (article) article.remove();
+        const tocLink = document.querySelector(`[data-toc-id="${{id}}"]`);
+        if (tocLink) tocLink.remove();
+      }});
+      updateCount();
+
+      // Diagnostic: check all articles
+      const allArticles = document.querySelectorAll('.article');
+      console.log('[membrane] total articles in DOM:', allArticles.length);
+      allArticles.forEach(art => {{
+        const body = art.querySelector('.article-body');
+        const title = art.querySelector('.article-title');
+        const bodyLen = body ? body.innerHTML.trim().length : -1;
+        if (bodyLen < 50) {{
+          console.warn('[membrane] EMPTY article:', art.id, 'title:', title ? title.textContent : 'NO TITLE', 'body length:', bodyLen);
+        }}
+      }});
+    }})();
   </script>
 </body>
 </html>"""
