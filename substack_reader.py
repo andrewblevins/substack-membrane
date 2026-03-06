@@ -218,9 +218,17 @@ def clean_html(html_body):
         '', raw_html, flags=re.IGNORECASE
     )
 
-    # Remove small Substack UI icons (forward, restack, arrow icons — 36px or smaller)
+    # Remove Substack UI icons — both direct and CDN-proxied versions
+    # Direct: src="...substack.com/icon/..."
+    # Proxied: src="...substackcdn.com/image/fetch/...substack.com%2Ficon%2F..."
     raw_html = re.sub(
-        r'<img[^>]*src="[^"]*substack\.com/icon/[^"]*"[^>]*/?\s*>',
+        r'<img[^>]*src="[^"]*(?:substack\.com/icon/|substack\.com%2Ficon%2F)[^"]*"[^>]*/?\s*>',
+        '', raw_html, flags=re.IGNORECASE
+    )
+
+    # Remove Substack author avatar/profile images
+    raw_html = re.sub(
+        r'<img[^>]*class="[^"]*(?:avatar|email-avatar)[^"]*"[^>]*/?\s*>',
         '', raw_html, flags=re.IGNORECASE
     )
 
