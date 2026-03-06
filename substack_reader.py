@@ -491,6 +491,20 @@ def fetch_articles(cfg):
 
         html_body, text_body = extract_body_html(msg)
 
+        # Extract subtitle from Substack's preview div (hidden email preview text)
+        subtitle = ""
+        if html_body:
+            preview_matches = re.findall(r'class="preview"[^>]*>([^<]+)<', html_body)
+            for p in preview_matches:
+                text = p.strip()
+                # Skip spacer divs full of unicode entities and very short strings
+                if len(text) > 10 and not text.startswith('&#'):
+                    # Clean up common prefixes
+                    text = re.sub(r'^(?:Listen|Watch|Read) now \(\d+ mins?\)\s*\|\s*', '', text).strip()
+                    if text:
+                        subtitle = text
+                    break
+
         if not original_url and html_body:
             vib = re.search(
                 r'href="([^"]+)"[^>]*>\s*(?:View (?:in browser|online)|Read online)',
@@ -512,6 +526,7 @@ def fetch_articles(cfg):
         articles.append({
             "title": subject,
             "author": author,
+            "subtitle": subtitle,
             "date": date_tuple.isoformat(),
             "date_display": date_tuple.strftime("%B %-d, %Y"),
             "content_html": content_html,
@@ -577,6 +592,7 @@ def generate_html(articles, output_path):
             + (f' &middot; <a href="{escape(art["original_url"], quote=True)}" class="original-link" target="_blank">View original</a>' if art.get("original_url") else '')
             + f'</div>'
             f'<h2 class="article-title">{safe_title}</h2>'
+            + (f'<p class="article-subtitle">{escape(art["subtitle"])}</p>' if art.get("subtitle") else '')
             + f'</header>'
             f'<div class="article-body">'
             f'{art["content_html"]}'
@@ -805,6 +821,15 @@ def generate_html(articles, output_path):
     line-height: 1.2;
     letter-spacing: -0.02em;
     color: var(--text);
+  }
+  .article-subtitle {
+    font-family: var(--serif);
+    font-size: 19px;
+    font-weight: 300;
+    line-height: 1.5;
+    color: var(--text-secondary);
+    margin-top: 10px;
+    font-style: italic;
   }
   .article-body {
     font-size: 19px;
