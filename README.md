@@ -2,23 +2,22 @@
 
 Pulls newsletters from your Gmail and renders them as a clean, calm reading page. No accounts, no apps, no tracking — just your email and a local HTML file.
 
-Works with Substack, WordPress, Buttondown, Patreon, and any other newsletter that lands in your inbox.
-
-![Preview](reading_preview.html)
+Works with Substack, NYT, WordPress, Buttondown, Patreon, and any other newsletter that lands in your inbox.
 
 ## How it works
 
 1. Connects to your Gmail over IMAP
 2. Pulls emails from a label you choose (e.g. `Newsletters`)
-3. Strips email chrome (footers, unsubscribe links, share buttons)
-4. Generates a static HTML reading page with a table of contents
-5. Tracks what it's already seen, so subsequent runs only fetch new articles
+3. Sanitizes HTML with bleach + lxml — strips email chrome, tracking pixels, share buttons, unsubscribe links
+4. Decodes Substack redirect URLs to actual destinations
+5. Extracts subtitles and links to original articles
+6. Generates a static HTML reading page with table of contents, dark mode, and single-article view
 
-Articles can be dismissed with the delete button — deletions persist across refreshes.
+Articles can be dismissed with the delete button — deletions persist across refreshes. Browser back/forward navigates between the table of contents and articles.
 
 ## Requirements
 
-- Python 3.7+ (no external dependencies)
+- Python 3.7+
 - A Gmail account with 2FA enabled
 
 ## Setup
@@ -81,15 +80,28 @@ Edit `config.json`:
 | `gmail_label` | Gmail label to search — leave empty `""` to search your inbox |
 | `auto_archive` | If `true`, marks fetched emails as read and archives them |
 
-### 4. Run it
+### 4. Install dependencies and run
 
 ```bash
-python3 substack_reader.py
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python3 substack_reader.py
 ```
 
 Then open `reading.html` in your browser.
 
 Run it again anytime to fetch new articles — it remembers what it's already seen.
+
+## Features
+
+- **Dark mode** — toggle in the header, preference persists
+- **Single-article view** — click a title in the TOC, browser back button works throughout
+- **Delete articles** — click the X button, deletions stored in localStorage
+- **Subtitles** — extracted from Substack emails and displayed under the article title
+- **Original links** — each article header links to the original post on the web
+- **Link decoding** — Substack tracking redirects are decoded to actual destination URLs
+- **HTML sanitization** — bleach whitelist strips everything to clean, readable semantic HTML
+- **Publication names** — extracted from email headers (strips "Person Name from" prefix)
 
 ## Files
 
@@ -98,6 +110,7 @@ Run it again anytime to fetch new articles — it remembers what it's already se
 | `substack_reader.py` | Main script |
 | `config.json` | Your credentials and settings (git-ignored) |
 | `config.example.json` | Template config |
+| `requirements.txt` | Python dependencies (bleach, lxml, lxml_html_clean) |
 | `reading.html` | Generated reading page (git-ignored) |
 | `reading_preview.html` | Demo page with sample articles |
 | `.reader_state.json` | Tracks seen articles between runs (git-ignored) |
@@ -107,6 +120,7 @@ Run it again anytime to fetch new articles — it remembers what it's already se
 - **Increase `max_articles`** if you have a large backlog to catch up on
 - **Run on a schedule** with cron to keep your reading page fresh:
   ```
-  0 */4 * * * cd /path/to/substack-membrane && python3 substack_reader.py
+  0 */4 * * * cd /path/to/substack-membrane && .venv/bin/python3 substack_reader.py
   ```
 - **Delete articles** you've read by clicking the X button — deletions are stored in your browser's localStorage
+- **Reset state** by deleting `.reader_state.json` to re-fetch everything
