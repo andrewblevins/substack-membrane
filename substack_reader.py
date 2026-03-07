@@ -860,19 +860,25 @@ def generate_html(articles, output_path):
     text-decoration-color: var(--accent);
   }
   .article-body figure {
-    margin: 1.6em 0;
+    margin: 1.8em 0;
     padding: 0;
+    text-align: center;
   }
   .article-body figure img {
     margin-bottom: 0;
   }
   .article-body figcaption {
     font-family: var(--sans);
-    font-size: 14px;
-    line-height: 1.5;
+    font-size: 13px;
+    line-height: 1.45;
     color: var(--text-secondary);
-    margin-top: 8px;
-    padding: 0 4px;
+    margin-top: 10px;
+    padding: 0 2em;
+    text-align: center;
+    font-style: italic;
+  }
+  .article-body figcaption em {
+    font-style: normal;
   }
   .article-body figcaption a {
     color: var(--text-secondary);
