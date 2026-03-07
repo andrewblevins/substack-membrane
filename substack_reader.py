@@ -1075,15 +1075,79 @@ def generate_html(articles, output_path):
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
+def refresh():
+    """Fetch new articles and regenerate the HTML file. Returns the output path."""
     cfg = load_config()
     articles = fetch_articles(cfg)
-    if not articles:
-        print("No articles found. Check your config and make sure Substack emails are arriving.")
-        return
     output = cfg.get("output_path", str(OUTPUT_PATH))
-    generate_html(articles, output)
-    print(f"\nDone! Open {output} in your browser.")
+    if articles:
+        generate_html(articles, output)
+    return output
+
+
+def main():
+    if "--serve" in sys.argv:
+        serve()
+    else:
+        output = refresh()
+        if Path(output).exists():
+            print(f"\nDone! Open {output} in your browser.")
+        else:
+            print("No articles found. Check your config and make sure Substack emails are arriving.")
+
+
+def serve(port=8000):
+    """Run a local HTTP server that refreshes articles on each page load."""
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    cfg = load_config()
+    output = cfg.get("output_path", str(OUTPUT_PATH))
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/" or self.path == "/index.html":
+                try:
+                    refresh()
+                except Exception as e:
+                    print(f"Refresh failed: {e}")
+                # Serve whatever we have (even if refresh failed)
+                try:
+                    with open(output, "rb") as f:
+                        content = f.read()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    self.write(content)
+                except FileNotFoundError:
+                    self.send_response(404)
+                    self.end_headers()
+                    self.wfile.write(b"No reading.html yet. Check your config.")
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def write(self, content):
+            self.wfile.write(content)
+
+        def log_message(self, format, *args):
+            # Quieter logging — just show refreshes, not every request
+            pass
+
+    # Do an initial refresh before starting
+    print(f"Initial refresh...")
+    try:
+        refresh()
+    except Exception as e:
+        print(f"Initial refresh failed: {e}")
+
+    server = HTTPServer(("127.0.0.1", port), Handler)
+    print(f"Serving at http://localhost:{port}")
+    print(f"Press Ctrl+C to stop.")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        server.server_close()
 
 
 if __name__ == "__main__":
