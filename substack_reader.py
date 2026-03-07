@@ -340,6 +340,14 @@ def clean_html(html_body):
         '', cleaned, flags=re.IGNORECASE
     )
 
+    # Wrap bare image captions (text not in any tag, directly after <img>)
+    # This pattern only appears in NYT emails — Substack uses <figcaption> natively
+    cleaned = re.sub(
+        r'(<img[^>]*>)\s*([^<]{5,300}?)\s*(<(?:p|h[1-6]|ul|ol|figure|hr)\b)',
+        lambda m: f'<figure>{m.group(1)}<figcaption>{m.group(2).strip()}</figcaption></figure>{m.group(3)}',
+        cleaned, flags=re.IGNORECASE
+    )
+
     # Remove zero-width/invisible Unicode characters and non-breaking space padding
     cleaned = re.sub(r'[\u200c\u200b\u200d\u034f\u00ad\ufeff\u2060\u2061\u2062\u2063\u2064]+', '', cleaned)
     # Collapse runs of non-breaking spaces (email preheader padding)
@@ -869,7 +877,7 @@ def generate_html(articles, output_path):
   }
   figcaption {
     font-family: var(--sans);
-    font-size: 12px;
+    font-size: 14px;
     line-height: 1.4;
     color: var(--text-secondary);
     margin-top: 8px;
