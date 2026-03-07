@@ -859,28 +859,28 @@ def generate_html(articles, output_path):
   .article-body a:hover {
     text-decoration-color: var(--accent);
   }
-  .article-body figure {
+  figure {
     margin: 1.8em 0;
     padding: 0;
     text-align: center;
   }
-  .article-body figure img {
-    margin-bottom: 0;
+  figure img {
+    margin-bottom: 0 !important;
   }
-  .article-body figcaption {
+  figcaption {
     font-family: var(--sans);
-    font-size: 13px;
-    line-height: 1.45;
+    font-size: 12px;
+    line-height: 1.4;
     color: var(--text-secondary);
-    margin-top: 10px;
-    padding: 0 2em;
+    margin-top: 8px;
+    padding: 0 3em;
     text-align: center;
+    letter-spacing: 0.01em;
+  }
+  figcaption em {
     font-style: italic;
   }
-  .article-body figcaption em {
-    font-style: normal;
-  }
-  .article-body figcaption a {
+  figcaption a {
     color: var(--text-secondary);
   }
   .article-body img {
