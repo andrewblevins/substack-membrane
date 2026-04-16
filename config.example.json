@@ -5,5 +5,9 @@
     "max_articles": 50,
     "output_path": "reading.html",
     "gmail_label": "",
-    "auto_archive": false
+    "auto_archive": false,
+    "anthropic_api_key": "",
+    "digest_exclude": [],
+    "digest_selection_threshold": 50,
+    "digest_selection_target": 40
 }

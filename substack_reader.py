@@ -30,7 +30,7 @@ import json
 import os
 import sys
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import bleach
 from lxml import html as lxml_html
@@ -573,6 +573,291 @@ def fetch_articles(cfg):
 
 
 # ---------------------------------------------------------------------------
+# Digest generation
+# ---------------------------------------------------------------------------
+
+SELECTION_PROMPT = """\
+You are curating a weekly reading digest. Below are {count} articles from the past {days} days, given with index, publication, title, date, and a short excerpt.
+
+Your job: select the {target} most digest-worthy articles.
+
+Criteria for inclusion (in rough priority order):
+- Substantive essays, arguments, and explorations — prefer depth over brevity
+- News and developments that are genuinely significant, not routine updates
+- Variety: if multiple articles cover the same event or story, pick the single best one
+- Skip: pure paywalled previews with no real content, subscription upsells, meetup announcements, comment notifications, "open thread" posts with no content, and routine daily news roundups that don't add original reporting
+
+Return ONLY a JSON array of the selected INDEX numbers, in the order you'd want them read (oldest to newest is fine). No explanation, no preamble — just the array.
+
+Example: [3, 7, 12, 15, 22]
+
+Articles:
+
+{articles}
+"""
+
+DIGEST_PROMPT = """\
+You are preparing a weekly reading digest. Below are articles from the past {days} days. Each article has an INDEX number — use it in your output exactly as shown.
+
+Produce a digest in EXACTLY TWO sections, in this order. Do not merge them, skip either, or add extra sections.
+
+SECTION 1 — output this h2 exactly:
+<h2 class="digest-section">What Happened</h2>
+
+News items, roundups, AI developments, current events, link roundups. For each entry:
+- Start with: <p class="digest-byline">PUBLICATION · DATE</p>
+- Then 1-2 tight sentences: what happened and why it matters. Be concise.
+- Then a verbatim pull quote in <blockquote> tags (one sentence or short passage).
+- Then a link: <a class="digest-source" data-article-index="INDEX">Read in app</a>
+  (use the INDEX from the article header; if original_url is available also add href="URL")
+
+SECTION 2 — output this h2 exactly:
+<h2 class="digest-section">What People Are Thinking About</h2>
+
+Essays, arguments, personal explorations, meditations, longer-form pieces. For each entry:
+- Start with: <p class="digest-byline">PUBLICATION · DATE</p>
+- Then one characterizing sentence capturing the move or angle of the piece (not a summary).
+- Then 3-5 sentences of substance — what the piece actually says or does.
+- Then a verbatim pull quote in <blockquote> tags.
+- Then a link: <a class="digest-source" data-article-index="INDEX">Read in app</a>
+  (use the INDEX from the article header; if original_url is available also add href="URL")
+
+Rules:
+- Every article goes in exactly one section.
+- Skip only: pure paywalled previews with no real content, subscription upsells, comment notifications, and meetup announcements.
+- Pull quotes must be verbatim from the article text.
+- Do not editorialize. Do not say "the author argues" — just describe what the piece does.
+- Wrap each entry in <div class="digest-entry">...</div>.
+- Output starts immediately with the first <h2>. No preamble, no conclusion.
+
+Here are the articles:
+
+{articles}
+"""
+
+def articles_to_digest_input(articles, index_offset=1):
+    """Format articles as plain text for the digest prompt. index_offset is position in full article list."""
+    parts = []
+    for i, (art, full_idx) in enumerate(articles):
+        body = re.sub(r'<[^>]+>', ' ', art.get('content_html', ''))
+        body = re.sub(r'\s+', ' ', body).strip()
+        if len(body) > 4000:
+            body = body[:4000] + '... [truncated]'
+        entry = (
+            f"--- ARTICLE INDEX={full_idx} ---\n"
+            f"Publication: {art['author']}\n"
+            f"Title: {art['title']}\n"
+            f"Date: {art['date_display']}\n"
+            f"URL: {art.get('original_url', '')}\n\n"
+            f"{body}\n"
+        )
+        parts.append(entry)
+    return "\n".join(parts)
+
+
+def articles_to_selection_input(articles_with_indices):
+    """Format articles as short summaries for the selection pass."""
+    parts = []
+    for art, full_idx in articles_with_indices:
+        body = re.sub(r'<[^>]+>', ' ', art.get('content_html', ''))
+        body = re.sub(r'\s+', ' ', body).strip()
+        excerpt = body[:300]
+        parts.append(
+            f"INDEX={full_idx} | {art['author']} | {art['date_display']}\n"
+            f"Title: {art['title']}\n"
+            f"Excerpt: {excerpt}\n"
+        )
+    return "\n".join(parts)
+
+
+def run_selection_pass(client, articles_with_indices, target, days):
+    """Ask Claude to select the best `target` articles. Returns list of full_idx ints."""
+    selection_input = articles_to_selection_input(articles_with_indices)
+    prompt = SELECTION_PROMPT.format(
+        count=len(articles_with_indices),
+        days=days,
+        target=target,
+        articles=selection_input,
+    )
+    print(f"Selecting {target} articles from {len(articles_with_indices)}... ", end="", flush=True)
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=512,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    print("done.")
+    raw = response.content[0].text.strip()
+    # Parse JSON array from response
+    match = re.search(r'\[[\d,\s]+\]', raw)
+    if not match:
+        print(f"Warning: could not parse selection response, using all articles. Response: {raw[:200]}")
+        return [idx for _, idx in articles_with_indices]
+    try:
+        selected = json.loads(match.group(0))
+        return [int(x) for x in selected]
+    except Exception:
+        print(f"Warning: could not parse selection JSON, using all articles.")
+        return [idx for _, idx in articles_with_indices]
+
+
+def generate_digest(days=7):
+    """
+    Generate a weekly digest article from articles in the past `days` days.
+    Returns an article dict suitable for prepending to the articles list, or None on failure.
+    """
+    cfg = load_config()
+    api_key = cfg.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("ERROR: No anthropic_api_key in config.json and ANTHROPIC_API_KEY env var not set.")
+        return None
+
+    try:
+        import anthropic
+    except ImportError:
+        print("ERROR: anthropic package not installed. Run: pip install anthropic")
+        return None
+
+    # Config options
+    exclude_sources = cfg.get("digest_exclude", [])  # list of publication name substrings to skip
+    selection_threshold = cfg.get("digest_selection_threshold", 50)  # run selection pass above this count
+    selection_target = cfg.get("digest_selection_target", 40)  # how many to select down to
+
+    state = load_state()
+    all_articles = state.get("articles", [])
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    recent = []
+    for art in all_articles:
+        try:
+            date = datetime.fromisoformat(art["date"])
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone.utc)
+            if date >= cutoff:
+                recent.append(art)
+        except Exception:
+            continue
+
+    # Apply exclude list
+    if exclude_sources:
+        before = len(recent)
+        recent = [
+            a for a in recent
+            if not any(ex.lower() in a.get("author", "").lower() for ex in exclude_sources)
+        ]
+        excluded = before - len(recent)
+        if excluded:
+            print(f"Excluded {excluded} articles from {len(exclude_sources)} source(s).")
+
+    if not recent:
+        print(f"No articles found in the past {days} days.")
+        return None
+
+    # Sort oldest-first for the prompt so Claude reads them chronologically
+    # Keep track of each article's index in the full list (digest will be prepended at 0,
+    # so full articles are at indices 1..N)
+    all_articles_sorted = sorted(all_articles, key=lambda a: a.get("date", ""), reverse=True)
+    # Build a lookup from message_id to full-list index (1-based since digest is at 0)
+    id_to_index = {a.get("message_id", ""): i + 1 for i, a in enumerate(all_articles_sorted)}
+
+    recent_sorted = sorted(recent, key=lambda a: a["date"])
+    recent_with_indices = [(art, id_to_index.get(art.get("message_id", ""), 0)) for art in recent_sorted]
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    # Selection pass if over threshold
+    if len(recent_with_indices) > selection_threshold:
+        print(f"{len(recent_with_indices)} articles exceeds threshold of {selection_threshold}.")
+        selected_indices = run_selection_pass(client, recent_with_indices, selection_target, days)
+        selected_set = set(selected_indices)
+        recent_with_indices = [(art, idx) for art, idx in recent_with_indices if idx in selected_set]
+        # Preserve order from selection response
+        order = {idx: i for i, idx in enumerate(selected_indices)}
+        recent_with_indices.sort(key=lambda x: order.get(x[1], 999))
+        print(f"Selected {len(recent_with_indices)} articles for digest.")
+
+    print(f"Generating digest from {len(recent_with_indices)} articles over the past {days} days...")
+
+    articles_text = articles_to_digest_input(recent_with_indices)
+    prompt = DIGEST_PROMPT.format(days=days, articles=articles_text)
+
+    print("Calling Claude... ", end="", flush=True)
+    digest_chunks = []
+    with client.messages.stream(
+        model="claude-sonnet-4-6",
+        max_tokens=16000,
+        messages=[{"role": "user", "content": prompt}],
+    ) as stream:
+        for i, text in enumerate(stream.text_stream):
+            digest_chunks.append(text)
+            if i % 50 == 0:
+                print(".", end="", flush=True)
+    print(" done.")
+    digest_html = "".join(digest_chunks).strip()
+
+    # Post-process: convert data-article-index into onclick="showArticle(N)" calls
+    def rewrite_article_link(m):
+        full_tag = m.group(0)
+        idx_m = re.search(r'data-article-index="(\d+)"', full_tag)
+        href_m = re.search(r'href="([^"]+)"', full_tag)
+        text_m = re.search(r'>([^<]+)<', full_tag)
+        idx = idx_m.group(1) if idx_m else None
+        href = href_m.group(1) if href_m else None
+        label = text_m.group(1).strip() if text_m else "Read"
+        if idx and int(idx) > 0:
+            onclick = f'onclick="showArticle({idx}); return false;"'
+            href_attr = f'href="{href}"' if href else 'href="#"'
+            return f'<a class="digest-source" {href_attr} {onclick}>{label}</a>'
+        elif href:
+            return f'<a class="digest-source" href="{href}" target="_blank">{label}</a>'
+        return full_tag
+
+    digest_html = re.sub(
+        r'<a[^>]*class="digest-source"[^>]*>.*?</a>',
+        rewrite_article_link,
+        digest_html,
+        flags=re.DOTALL,
+    )
+
+    # Date range label — use the full recent set (before selection) for the date range
+    all_recent = [art for art, _ in recent_with_indices] or recent
+    oldest = min(all_recent, key=lambda a: a["date"])
+    newest = max(all_recent, key=lambda a: a["date"])
+    try:
+        oldest_dt = datetime.fromisoformat(oldest["date"])
+        newest_dt = datetime.fromisoformat(newest["date"])
+        date_range = f"{oldest_dt.strftime('%B %-d')} – {newest_dt.strftime('%B %-d, %Y')}"
+    except Exception:
+        date_range = datetime.now().strftime("%B %-d, %Y")
+
+    title = f"Weekly Digest: {date_range}"
+    now = datetime.now(timezone.utc)
+
+    digest_article = {
+        "title": title,
+        "author": "Digest",
+        "subtitle": f"{len(recent_with_indices)} articles from the past {days} days",
+        "date": now.isoformat(),
+        "date_display": now.strftime("%B %-d, %Y"),
+        "content_html": digest_html,
+        "message_id": f"digest-{now.strftime('%Y-%m-%d')}",
+        "original_url": "",
+        "is_digest": True,
+    }
+
+    # Persist digest into state so it survives refreshes
+    state = load_state()
+    digests = state.get("digests", [])
+    # Replace any existing digest with the same message_id (same day re-run)
+    digests = [d for d in digests if d.get("message_id") != digest_article["message_id"]]
+    digests.insert(0, digest_article)
+    state["digests"] = digests
+    save_state(state)
+
+    print(f"Digest generated: {title}")
+    return digest_article
+
+
+# ---------------------------------------------------------------------------
 # HTML generation
 # ---------------------------------------------------------------------------
 
@@ -614,10 +899,13 @@ def generate_html(articles, output_path):
         safe_title = escape(art['title'])
         safe_author = escape(art['author'])
         safe_mid = escape(mid, quote=True)
+        is_digest = art.get('is_digest', False)
+        digest_badge = '<span class="toc-digest-badge">Digest</span>' if is_digest else ''
+        toc_class = 'toc-item toc-item--digest' if is_digest else 'toc-item'
         toc_items.append(
-            f'<div class="toc-item" data-toc-id="{safe_mid}" onclick="showArticle({i})">'
+            f'<div class="{toc_class}" data-toc-id="{safe_mid}" onclick="showArticle({i})">'
             f'<span class="toc-author">{safe_author}</span>'
-            f'<span class="toc-title">{safe_title}</span>'
+            f'<span class="toc-title">{safe_title}{digest_badge}</span>'
             f'<span class="toc-date">{art["date_display"]}</span>'
             f'</div>'
         )
@@ -738,6 +1026,26 @@ def generate_html(articles, output_path):
     transition: color 0.15s;
   }
   .toc-item:hover { color: var(--accent); }
+  .toc-item--digest {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 12px;
+    margin-bottom: 4px;
+  }
+  .toc-digest-badge {
+    display: inline-block;
+    font-family: var(--sans);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 3px;
+    padding: 1px 5px;
+    margin-left: 8px;
+    vertical-align: middle;
+    opacity: 0.8;
+  }
   .toc-author {
     font-family: var(--sans);
     font-size: 13px;
@@ -944,6 +1252,126 @@ def generate_html(articles, output_path):
   }
   .back-top.visible { opacity: 1; }
 
+  /* Digest styles */
+  .digest-section {
+    font-family: var(--sans);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+    margin: 2.8em 0 1.6em;
+    padding-top: 2em;
+    border-top: 1px solid var(--border);
+  }
+  .article-body .digest-section:first-child {
+    margin-top: 0;
+    padding-top: 0;
+    border-top: none;
+  }
+  .digest-entry {
+    margin-bottom: 2.4em;
+    padding-bottom: 2.4em;
+    border-bottom: 1px solid var(--border);
+  }
+  .digest-entry:last-child {
+    border-bottom: none;
+  }
+  .digest-byline {
+    font-family: var(--sans);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin-bottom: 0.5em !important;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  .digest-entry p { margin-bottom: 0.8em; }
+  .digest-entry blockquote {
+    border-left: 2px solid var(--accent);
+    padding-left: 20px;
+    margin: 1em 0;
+    color: var(--text-secondary);
+    font-style: italic;
+    font-size: 17px;
+    line-height: 1.6;
+  }
+  .digest-entry a.digest-source {
+    display: inline-block;
+    font-family: var(--sans);
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--accent);
+    text-decoration: none;
+    margin-top: 0.4em;
+    cursor: pointer;
+  }
+  .digest-entry a.digest-source:hover { text-decoration: underline; }
+
+  /* Digest button + loading overlay */
+  .digest-btn {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    font-family: var(--sans);
+    font-size: 12px;
+    font-weight: 500;
+    padding: 6px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.2s;
+    white-space: nowrap;
+  }
+  .digest-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .digest-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .digest-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.45);
+    z-index: 100;
+    align-items: center;
+    justify-content: center;
+  }
+  .digest-overlay.visible {
+    display: flex;
+  }
+  .digest-overlay-box {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 36px 48px;
+    text-align: center;
+    font-family: var(--sans);
+  }
+  .digest-overlay-title {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 12px;
+  }
+  .digest-overlay-sub {
+    font-size: 13px;
+    color: var(--text-secondary);
+    margin-bottom: 20px;
+  }
+  .digest-spinner {
+    width: 28px;
+    height: 28px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    margin: 0 auto;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
   @media (max-width: 1024px) {
     :root {
       --content-width: 100%;
@@ -1060,6 +1488,66 @@ def generate_html(articles, output_path):
       });
       updateCount();
     })();
+
+    // Digest generation
+    function startDigest() {
+      const btn = document.getElementById('digest-btn');
+      const overlay = document.getElementById('digest-overlay');
+      const sub = document.getElementById('digest-overlay-sub');
+      btn.disabled = true;
+      overlay.classList.add('visible');
+      sub.textContent = 'Reading your newsletters\u2026';
+      fetch('/digest?days=7')
+        .then(r => r.json())
+        .then(data => {
+          if (data.status === 'started' || data.status === 'running') {
+            pollDigest(overlay, sub, btn);
+          } else {
+            showDigestError(overlay, sub, btn, 'Unexpected response from server.');
+          }
+        })
+        .catch(e => {
+          showDigestError(overlay, sub, btn, 'Could not reach server. Are you running --serve?');
+        });
+    }
+
+    function pollDigest(overlay, sub, btn) {
+      const messages = [
+        'Reading your newsletters\u2026',
+        'Selecting articles\u2026',
+        'Summarising\u2026',
+        'Finding pull quotes\u2026',
+        'Almost done\u2026',
+      ];
+      let tick = 0;
+      const interval = setInterval(() => {
+        tick++;
+        sub.textContent = messages[Math.min(tick, messages.length - 1)];
+        fetch('/digest/status')
+          .then(r => r.json())
+          .then(data => {
+            if (data.status === 'done') {
+              clearInterval(interval);
+              overlay.classList.remove('visible');
+              btn.disabled = false;
+              window.location.reload();
+            } else if (data.status === 'error') {
+              clearInterval(interval);
+              showDigestError(overlay, sub, btn, data.message || 'Generation failed.');
+            }
+            // still 'running' — keep polling
+          })
+          .catch(() => {
+            // network hiccup — keep trying
+          });
+      }, 4000);
+    }
+
+    function showDigestError(overlay, sub, btn, msg) {
+      overlay.classList.remove('visible');
+      btn.disabled = false;
+      alert('Digest error: ' + msg);
+    }
 </script>"""
 
     articles_html = "\n".join(article_blocks)
@@ -1079,9 +1567,18 @@ def generate_html(articles, output_path):
         f'      <div class="article-count">{count_str}</div>\n',
         '    </div>\n'
         '    <div class="header-right">\n'
+        '      <button class="digest-btn" onclick="startDigest()" id="digest-btn">Generate Digest</button>\n'
         '      <button class="theme-toggle" onclick="toggleTheme()" aria-label="Toggle dark mode" title="Toggle dark mode">\n'
         '        <span class="theme-icon"></span>\n'
         '      </button>\n'
+        '    </div>\n'
+        '  </div>\n'
+        '\n'
+        '  <div class="digest-overlay" id="digest-overlay">\n'
+        '    <div class="digest-overlay-box">\n'
+        '      <div class="digest-overlay-title">Generating digest\u2026</div>\n'
+        '      <div class="digest-overlay-sub" id="digest-overlay-sub">Reading your newsletters</div>\n'
+        '      <div class="digest-spinner"></div>\n'
         '    </div>\n'
         '  </div>\n'
         '\n'
@@ -1107,11 +1604,23 @@ def generate_html(articles, output_path):
 # Main
 # ---------------------------------------------------------------------------
 
-def refresh():
+def refresh(digest_article=None):
     """Fetch new articles and regenerate the HTML file. Returns the output path."""
     cfg = load_config()
     articles = fetch_articles(cfg)
     output = cfg.get("output_path", str(OUTPUT_PATH))
+
+    # Load persisted digests from state and prepend them
+    state = load_state()
+    saved_digests = state.get("digests", [])
+
+    # If a fresh digest was just generated, it takes priority over the saved one for the same day
+    if digest_article:
+        saved_digests = [d for d in saved_digests if d.get("message_id") != digest_article.get("message_id")]
+        saved_digests = [digest_article] + saved_digests
+
+    articles = saved_digests + articles
+
     if articles:
         generate_html(articles, output)
     return output
@@ -1120,6 +1629,27 @@ def refresh():
 def main():
     if "--serve" in sys.argv:
         serve()
+        return
+
+    # Parse --digest flag (optionally followed by number of days, e.g. --digest 7)
+    digest_days = None
+    args = sys.argv[1:]
+    if "--digest" in args:
+        idx = args.index("--digest")
+        digest_days = 7  # default
+        if idx + 1 < len(args):
+            try:
+                digest_days = int(args[idx + 1])
+            except ValueError:
+                pass
+
+    if digest_days is not None:
+        digest_article = generate_digest(days=digest_days)
+        if digest_article:
+            output = refresh(digest_article=digest_article)
+            print(f"\nDone! Open {output} in your browser.")
+        else:
+            print("Digest generation failed.")
     else:
         output = refresh()
         if Path(output).exists():
@@ -1131,42 +1661,90 @@ def main():
 def serve(port=8000):
     """Run a local HTTP server that refreshes articles on each page load."""
     from http.server import HTTPServer, BaseHTTPRequestHandler
+    import threading
+    import urllib.parse
 
     cfg = load_config()
     output = cfg.get("output_path", str(OUTPUT_PATH))
 
+    # Shared state for digest generation
+    digest_state = {"running": False, "error": None}
+
+    def run_digest(days):
+        try:
+            digest_article = generate_digest(days=days)
+            if digest_article:
+                refresh(digest_article=digest_article)
+                digest_state["error"] = None
+            else:
+                digest_state["error"] = "Digest generation returned no content."
+        except Exception as e:
+            digest_state["error"] = str(e)
+            print(f"Digest generation error: {e}")
+        finally:
+            digest_state["running"] = False
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            if self.path == "/" or self.path == "/index.html":
+            parsed = urllib.parse.urlparse(self.path)
+
+            if parsed.path == "/digest":
+                # Trigger digest generation in background thread
+                params = urllib.parse.parse_qs(parsed.query)
+                days = int(params.get("days", ["7"])[0])
+                if digest_state["running"]:
+                    self._json({"status": "running"})
+                    return
+                digest_state["running"] = True
+                digest_state["error"] = None
+                t = threading.Thread(target=run_digest, args=(days,), daemon=True)
+                t.start()
+                self._json({"status": "started"})
+                return
+
+            if parsed.path == "/digest/status":
+                if digest_state["running"]:
+                    self._json({"status": "running"})
+                elif digest_state["error"]:
+                    self._json({"status": "error", "message": digest_state["error"]})
+                else:
+                    self._json({"status": "done"})
+                return
+
+            if parsed.path in ("/", "/index.html"):
                 try:
                     refresh()
                 except Exception as e:
                     print(f"Refresh failed: {e}")
-                # Serve whatever we have (even if refresh failed)
                 try:
                     with open(output, "rb") as f:
                         content = f.read()
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.end_headers()
-                    self.write(content)
+                    self.wfile.write(content)
                 except FileNotFoundError:
                     self.send_response(404)
                     self.end_headers()
                     self.wfile.write(b"No reading.html yet. Check your config.")
-            else:
-                self.send_response(404)
-                self.end_headers()
+                return
 
-        def write(self, content):
-            self.wfile.write(content)
+            self.send_response(404)
+            self.end_headers()
+
+        def _json(self, data):
+            body = json.dumps(data).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def log_message(self, format, *args):
-            # Quieter logging — just show refreshes, not every request
             pass
 
     # Do an initial refresh before starting
-    print(f"Initial refresh...")
+    print("Initial refresh...")
     try:
         refresh()
     except Exception as e:
