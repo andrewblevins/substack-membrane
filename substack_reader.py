@@ -218,9 +218,14 @@ def clean_html(html_body):
     # Serialize back to HTML string
     raw_html = lxml_html.tostring(cleaned_doc, encoding='unicode')
 
-    # Remove tracking pixels (1x1 images)
+    # Remove tracking pixels (1x1 images, or dimensionless beacons)
     raw_html = re.sub(
-        r'<img[^>]*(?:width="1"|height="1")[^>]*/?\s*>',
+        r'<img[^>]*(?:width="[01]"|height="[01]")[^>]*/?\s*>',
+        '', raw_html, flags=re.IGNORECASE
+    )
+    # Remove known tracking beacon URLs (Substack open-tracking pixels and common pixel services)
+    raw_html = re.sub(
+        r'<img[^>]*src="[^"]*(?:stpe=default|/imp\?s=|/open\?|/track/open|/wf/open|pixel\.gif|beacon\.gif|tracking\.gif)[^"]*"[^>]*/?\s*>',
         '', raw_html, flags=re.IGNORECASE
     )
 
