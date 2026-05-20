@@ -551,13 +551,11 @@ def fetch_articles(cfg):
         archive_ids.append(mid)
         new_count += 1
 
-    # Optionally auto-archive fetched newsletter posts (mark read + move out of inbox)
+    # Optionally auto-archive fetched newsletter posts (mark read + delete from inbox)
     if cfg.get("auto_archive") and archive_ids:
         print(f"Auto-archiving {len(archive_ids)} newsletter posts...")
         for mid in archive_ids:
             mail.store(mid, "+FLAGS", "\\Seen")
-            # In Gmail IMAP, "archiving" = removing INBOX label
-            mail.copy(mid, "[Gmail]/All Mail")
             mail.store(mid, "+FLAGS", "\\Deleted")
         mail.expunge()
 
