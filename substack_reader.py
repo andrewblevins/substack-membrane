@@ -910,6 +910,7 @@ def generate_html(articles, output_path):
             f'<span class="toc-author">{safe_author}</span>'
             f'<span class="toc-title">{safe_title}{digest_badge}</span>'
             f'<span class="toc-date">{art["date_display"]}</span>'
+            f'<button class="toc-delete-btn" onclick="event.stopPropagation(); deleteArticle(\'{safe_mid}\')" aria-label="Remove" title="Remove">&times;</button>'
             f'</div>'
         )
 
@@ -1069,6 +1070,20 @@ def generate_html(articles, output_path):
     color: var(--text-secondary);
     flex-shrink: 0;
   }
+  .toc-delete-btn {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    font-size: 16px;
+    line-height: 1;
+    padding: 0 0 0 8px;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s, color 0.15s;
+    flex-shrink: 0;
+  }
+  .toc-item:hover .toc-delete-btn { opacity: 0.5; }
+  .toc-delete-btn:hover { opacity: 1 !important; color: var(--accent); }
 
   .article {
     max-width: var(--content-width);
