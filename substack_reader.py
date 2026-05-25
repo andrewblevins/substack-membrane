@@ -1566,6 +1566,55 @@ def generate_html(articles, output_path):
       btn.disabled = false;
       alert('Digest error: ' + msg);
     }
+
+    // Refresh (fetch new articles)
+    function startRefresh() {
+      const btn = document.getElementById('refresh-btn');
+      const overlay = document.getElementById('digest-overlay');
+      const title = document.querySelector('.digest-overlay-title');
+      const sub = document.getElementById('digest-overlay-sub');
+      btn.disabled = true;
+      const originalTitle = title.textContent;
+      title.textContent = 'Refreshing…';
+      sub.textContent = 'Checking for new articles…';
+      overlay.classList.add('visible');
+      fetch('/refresh')
+        .then(r => r.json())
+        .then(data => {
+          if (data.status === 'started' || data.status === 'running') {
+            pollRefresh(overlay, title, sub, btn, originalTitle);
+          } else {
+            showRefreshError(overlay, title, sub, btn, originalTitle, 'Unexpected response from server.');
+          }
+        })
+        .catch(() => {
+          showRefreshError(overlay, title, sub, btn, originalTitle, 'Could not reach server. Are you running --serve?');
+        });
+    }
+
+    function pollRefresh(overlay, title, sub, btn, originalTitle) {
+      const interval = setInterval(() => {
+        fetch('/refresh/status')
+          .then(r => r.json())
+          .then(data => {
+            if (data.status === 'done') {
+              clearInterval(interval);
+              window.location.reload();
+            } else if (data.status === 'error') {
+              clearInterval(interval);
+              showRefreshError(overlay, title, sub, btn, originalTitle, data.message || 'Refresh failed.');
+            }
+          })
+          .catch(() => {});
+      }, 2000);
+    }
+
+    function showRefreshError(overlay, title, sub, btn, originalTitle, msg) {
+      overlay.classList.remove('visible');
+      title.textContent = originalTitle;
+      btn.disabled = false;
+      alert('Refresh error: ' + msg);
+    }
 </script>"""
 
     articles_html = "\n".join(article_blocks)
@@ -1585,6 +1634,7 @@ def generate_html(articles, output_path):
         f'      <div class="article-count">{count_str}</div>\n',
         '    </div>\n'
         '    <div class="header-right">\n'
+        '      <button class="digest-btn" onclick="startRefresh()" id="refresh-btn">Refresh</button>\n'
         '      <button class="digest-btn" onclick="startDigest()" id="digest-btn">Generate Digest</button>\n'
         '      <button class="theme-toggle" onclick="toggleTheme()" aria-label="Toggle dark mode" title="Toggle dark mode">\n'
         '        <span class="theme-icon"></span>\n'
@@ -1687,6 +1737,7 @@ def serve(port=8000):
 
     # Shared state for digest generation
     digest_state = {"running": False, "error": None}
+    refresh_state = {"running": False, "error": None}
 
     def run_digest(days):
         try:
@@ -1701,6 +1752,16 @@ def serve(port=8000):
             print(f"Digest generation error: {e}")
         finally:
             digest_state["running"] = False
+
+    def run_refresh():
+        try:
+            refresh()
+            refresh_state["error"] = None
+        except Exception as e:
+            refresh_state["error"] = str(e)
+            print(f"Refresh error: {e}")
+        finally:
+            refresh_state["running"] = False
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -1725,6 +1786,26 @@ def serve(port=8000):
                     self._json({"status": "running"})
                 elif digest_state["error"]:
                     self._json({"status": "error", "message": digest_state["error"]})
+                else:
+                    self._json({"status": "done"})
+                return
+
+            if parsed.path == "/refresh":
+                if refresh_state["running"]:
+                    self._json({"status": "running"})
+                    return
+                refresh_state["running"] = True
+                refresh_state["error"] = None
+                t = threading.Thread(target=run_refresh, daemon=True)
+                t.start()
+                self._json({"status": "started"})
+                return
+
+            if parsed.path == "/refresh/status":
+                if refresh_state["running"]:
+                    self._json({"status": "running"})
+                elif refresh_state["error"]:
+                    self._json({"status": "error", "message": refresh_state["error"]})
                 else:
                     self._json({"status": "done"})
                 return
